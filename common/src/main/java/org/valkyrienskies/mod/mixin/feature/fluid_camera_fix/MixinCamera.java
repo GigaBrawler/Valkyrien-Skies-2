@@ -13,6 +13,8 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.valkyrienskies.mod.common.VSGameUtilsKt;
+import org.valkyrienskies.mod.common.config.VSGameConfig;
+import org.valkyrienskies.mod.common.feature.ship_water_pockets.ShipWaterPocketManager;
 
 @Mixin(Camera.class)
 public abstract class MixinCamera {
@@ -29,25 +31,37 @@ public abstract class MixinCamera {
     )
     private FluidState getFluidInCamera(final BlockGetter instance, final BlockPos blockPos,
         final Operation<FluidState> getFluidState) {
-        final FluidState[] fluidState = {getFluidState.call(instance, blockPos)};
+        final FluidState original = getFluidState.call(instance, blockPos);
         isShipWater = false;
-        if (fluidState[0].isEmpty() && instance instanceof final Level level) {
+        if (instance instanceof final Level level) {
+            if (VSGameConfig.COMMON.WATER_POCKETS.getEnableShipWaterPockets()) {
+                final Vec3 pos = this.getPosition();
+                final FluidState overridden =
+                    ShipWaterPocketManager.overrideWaterFluidState(level, pos.x, pos.y, pos.z, original);
+                isShipWater = overridden != original && !overridden.isEmpty();
+                return overridden;
+            }
 
-            final double origX = this.getPosition().x;
-            final double origY = this.getPosition().y;
-            final double origZ = this.getPosition().z;
+            if (original.isEmpty()) {
+                final FluidState[] fluidState = {original};
 
-            VSGameUtilsKt.transformToNearbyShipsAndWorld(level, origX, origY, origZ, 1,
-                (x, y, z) -> {
-                    fluidState[0] = instance.getBlockState(BlockPos.containing(x, y, z))
-                        .getFluidState();
-                    if (!fluidState[0].isEmpty()) {
-                        isShipWater = true;
-                    }
-                });
+                final double origX = this.getPosition().x;
+                final double origY = this.getPosition().y;
+                final double origZ = this.getPosition().z;
 
+                VSGameUtilsKt.transformToNearbyShipsAndWorld(level, origX, origY, origZ, 1,
+                    (x, y, z) -> {
+                        fluidState[0] = instance.getBlockState(BlockPos.containing(x, y, z))
+                            .getFluidState();
+                        if (!fluidState[0].isEmpty()) {
+                            isShipWater = true;
+                        }
+                    });
+
+                return fluidState[0];
+            }
         }
-        return fluidState[0];
+        return original;
     }
 
     @WrapOperation(

@@ -61,6 +61,7 @@ import org.valkyrienskies.mod.common.ValkyrienSkiesMod;
 import org.valkyrienskies.mod.common.config.DimensionParametersResolver;
 import org.valkyrienskies.mod.common.config.MassDatapackResolver;
 import org.valkyrienskies.mod.common.hooks.VSGameEvents;
+import org.valkyrienskies.mod.common.feature.ship_water_pockets.ShipWaterPocketManager;
 import org.valkyrienskies.mod.common.util.EntityDragger;
 import org.valkyrienskies.mod.common.util.ShipSettingsKt;
 import org.valkyrienskies.mod.common.util.VSLevelChunk;
@@ -254,6 +255,7 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
             EntityDragger.INSTANCE.dragEntitiesWithShips(level.getAllEntities(), false);
             if (LoadedMods.getWeather2())
                 Weather2Compat.INSTANCE.tick(level);
+            ShipWaterPocketManager.tickServerLevel(level);
         }
 
         //TODO must reimplement

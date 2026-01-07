@@ -1,0 +1,1049 @@
+package org.valkyrienskies.mod.common.feature.ship_water_pockets
+
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet
+import net.minecraft.core.BlockPos
+import net.minecraft.world.phys.AABB
+import net.minecraft.server.level.ServerLevel
+import net.minecraft.util.Mth
+import net.minecraft.world.level.Level
+import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.block.DoorBlock
+import net.minecraft.world.level.block.FenceBlock
+import net.minecraft.world.level.block.FenceGateBlock
+import net.minecraft.world.level.block.IronBarsBlock
+import net.minecraft.world.level.block.SlabBlock
+import net.minecraft.world.level.block.StairBlock
+import net.minecraft.world.level.block.TrapDoorBlock
+import net.minecraft.world.level.block.WallBlock
+import net.minecraft.world.level.block.state.BlockState
+import net.minecraft.world.level.block.state.properties.BlockStateProperties
+import net.minecraft.world.level.block.state.properties.StairsShape
+import net.minecraft.world.level.block.state.properties.WallSide
+import net.minecraft.world.level.material.Fluids
+import org.apache.logging.log4j.LogManager
+import org.joml.Vector3d
+import org.joml.primitives.AABBd
+import org.valkyrienskies.core.api.ships.ClientShip
+import org.valkyrienskies.core.api.ships.LoadedShip
+import org.valkyrienskies.core.api.ships.Ship
+import org.valkyrienskies.core.api.ships.properties.ShipTransform
+import org.valkyrienskies.core.api.world.properties.DimensionId
+import org.valkyrienskies.mod.common.config.VSGameConfig
+import org.valkyrienskies.mod.common.dimensionId
+import org.valkyrienskies.mod.common.isBlockInShipyard
+import org.valkyrienskies.mod.common.shipObjectWorld
+import java.util.BitSet
+import java.util.concurrent.ConcurrentHashMap
+
+object ShipWaterPocketManager {
+    private val log = LogManager.getLogger("VS2 ShipWaterPockets")
+
+    private const val FLOOD_UPDATE_INTERVAL_TICKS = 10L
+    private const val MAX_SIM_VOLUME = 2_000_000
+
+    @Volatile
+    private var applyingInternalUpdates: Boolean = false
+
+    private data class ShipPocketState(
+        var minX: Int = 0,
+        var minY: Int = 0,
+        var minZ: Int = 0,
+        var sizeX: Int = 0,
+        var sizeY: Int = 0,
+        var sizeZ: Int = 0,
+        var open: BitSet = BitSet(),
+        var interior: BitSet = BitSet(),
+        var flooded: BitSet = BitSet(),
+        var materializedWater: BitSet = BitSet(),
+        var waterReachable: BitSet = BitSet(),
+        var dirty: Boolean = true,
+        var lastFloodUpdateTick: Long = Long.MIN_VALUE,
+        var lastWaterReachableUpdateTick: Long = Long.MIN_VALUE,
+    )
+
+    private val serverStates: ConcurrentHashMap<DimensionId, ConcurrentHashMap<Long, ShipPocketState>> =
+        ConcurrentHashMap()
+    private val clientStates: ConcurrentHashMap<DimensionId, ConcurrentHashMap<Long, ShipPocketState>> =
+        ConcurrentHashMap()
+
+    private val tmpQueryAabb: ThreadLocal<AABBd> = ThreadLocal.withInitial { AABBd() }
+    private val tmpWorldPos: ThreadLocal<Vector3d> = ThreadLocal.withInitial { Vector3d() }
+    private val tmpShipPos: ThreadLocal<Vector3d> = ThreadLocal.withInitial { Vector3d() }
+    private val tmpShipBlockPos: ThreadLocal<BlockPos.MutableBlockPos> =
+        ThreadLocal.withInitial { BlockPos.MutableBlockPos() }
+    private val tmpFloodQueue: ThreadLocal<IntArray> = ThreadLocal.withInitial { IntArray(0) }
+
+    private const val POINT_QUERY_EPS: Double = 1e-5
+
+    @JvmStatic
+    fun isApplyingInternalUpdates(): Boolean = applyingInternalUpdates
+
+    @JvmStatic
+    fun markShipDirty(level: Level, shipId: Long) {
+        if (!VSGameConfig.COMMON.WATER_POCKETS.enableShipWaterPockets) return
+        val map = (if (level.isClientSide) clientStates else serverStates)
+            .computeIfAbsent(level.dimensionId) { ConcurrentHashMap() }
+        map.computeIfAbsent(shipId) { ShipPocketState() }.dirty = true
+    }
+
+    @JvmStatic
+    fun tickServerLevel(level: ServerLevel) {
+        if (!VSGameConfig.COMMON.WATER_POCKETS.enableShipWaterPockets) return
+
+        val states = serverStates.computeIfAbsent(level.dimensionId) { ConcurrentHashMap() }
+        val loadedShipIds = LongOpenHashSet()
+
+        level.shipObjectWorld.loadedShips.forEach { ship ->
+            loadedShipIds.add(ship.id)
+            val state = states.computeIfAbsent(ship.id) { ShipPocketState() }
+
+            val aabb = ship.shipAABB ?: return@forEach
+            val sizeX = aabb.maxX() - aabb.minX()
+            val sizeY = aabb.maxY() - aabb.minY()
+            val sizeZ = aabb.maxZ() - aabb.minZ()
+            val volume = sizeX.toLong() * sizeY.toLong() * sizeZ.toLong()
+            if (volume <= 0 || volume > MAX_SIM_VOLUME.toLong()) {
+                if (state.dirty) {
+                    log.warn("Skipping ship water pockets for ship {} (volume={}, max={})", ship.id, volume, MAX_SIM_VOLUME)
+                    state.dirty = false
+                }
+                return@forEach
+            }
+
+            val needsRecompute = state.dirty || state.sizeX != sizeX || state.sizeY != sizeY || state.sizeZ != sizeZ ||
+                state.minX != aabb.minX() || state.minY != aabb.minY() || state.minZ != aabb.minZ()
+            if (needsRecompute) {
+                recomputeState(level, ship, state, aabb.minX(), aabb.minY(), aabb.minZ(), sizeX, sizeY, sizeZ)
+            }
+
+            val now = level.gameTime
+            val shipTransform = getQueryTransform(ship)
+            if (needsRecompute || now != state.lastWaterReachableUpdateTick) {
+                state.waterReachable = computeWaterReachable(level, state, shipTransform)
+                state.lastWaterReachableUpdateTick = now
+            }
+            if (needsRecompute || now - state.lastFloodUpdateTick >= FLOOD_UPDATE_INTERVAL_TICKS) {
+                updateFlooding(level, ship, state, shipTransform)
+                state.lastFloodUpdateTick = now
+            }
+        }
+
+        // Cleanup unloaded ships
+        states.keys.removeIf { !loadedShipIds.contains(it) }
+    }
+
+    @JvmStatic
+    fun tickClientLevel(level: Level) {
+        if (!level.isClientSide) return
+        if (!VSGameConfig.COMMON.WATER_POCKETS.enableShipWaterPockets) return
+
+        val states = clientStates.computeIfAbsent(level.dimensionId) { ConcurrentHashMap() }
+        val loadedShipIds = LongOpenHashSet()
+
+        level.shipObjectWorld.loadedShips.forEach { ship ->
+            loadedShipIds.add(ship.id)
+            val state = states.computeIfAbsent(ship.id) { ShipPocketState() }
+
+            val aabb = ship.shipAABB ?: return@forEach
+            val sizeX = aabb.maxX() - aabb.minX()
+            val sizeY = aabb.maxY() - aabb.minY()
+            val sizeZ = aabb.maxZ() - aabb.minZ()
+            val volume = sizeX.toLong() * sizeY.toLong() * sizeZ.toLong()
+            if (volume <= 0 || volume > MAX_SIM_VOLUME.toLong()) {
+                state.dirty = false
+                return@forEach
+            }
+
+            if (state.dirty || state.sizeX != sizeX || state.sizeY != sizeY || state.sizeZ != sizeZ ||
+                state.minX != aabb.minX() || state.minY != aabb.minY() || state.minZ != aabb.minZ()
+            ) {
+                recomputeState(level, ship, state, aabb.minX(), aabb.minY(), aabb.minZ(), sizeX, sizeY, sizeZ)
+            }
+
+            val now = level.gameTime
+            if (now != state.lastWaterReachableUpdateTick) {
+                state.waterReachable = computeWaterReachable(level, state, getQueryTransform(ship))
+                state.lastWaterReachableUpdateTick = now
+            }
+        }
+
+        states.keys.removeIf { !loadedShipIds.contains(it) }
+    }
+
+    data class ClientWaterReachableSnapshot(
+        val minX: Int,
+        val minY: Int,
+        val minZ: Int,
+        val sizeX: Int,
+        val sizeY: Int,
+        val sizeZ: Int,
+        val open: BitSet,
+        val waterReachable: BitSet,
+    )
+
+    @JvmStatic
+    fun getClientWaterReachableSnapshot(level: Level, shipId: Long): ClientWaterReachableSnapshot? {
+        if (!level.isClientSide) return null
+        val state = clientStates[level.dimensionId]?.get(shipId) ?: return null
+        return ClientWaterReachableSnapshot(
+            state.minX,
+            state.minY,
+            state.minZ,
+            state.sizeX,
+            state.sizeY,
+            state.sizeZ,
+            state.open,
+            state.waterReachable,
+        )
+    }
+
+    @JvmStatic
+    fun overrideWaterFluidState(level: Level, worldBlockPos: BlockPos, original: net.minecraft.world.level.material.FluidState): net.minecraft.world.level.material.FluidState {
+        if (!VSGameConfig.COMMON.WATER_POCKETS.enableShipWaterPockets) return original
+        if (level.isBlockInShipyard(worldBlockPos)) return original
+        if (!original.isEmpty && !original.`is`(Fluids.WATER)) return original
+
+        val queryAabb = tmpQueryAabb.get().apply {
+            minX = worldBlockPos.x.toDouble()
+            minY = worldBlockPos.y.toDouble()
+            minZ = worldBlockPos.z.toDouble()
+            maxX = (worldBlockPos.x + 1).toDouble()
+            maxY = (worldBlockPos.y + 1).toDouble()
+            maxZ = (worldBlockPos.z + 1).toDouble()
+        }
+        val worldPos = tmpWorldPos.get().set(
+            worldBlockPos.x + 0.5,
+            worldBlockPos.y + 0.5,
+            worldBlockPos.z + 0.5
+        )
+        val shipPosTmp = tmpShipPos.get()
+        val shipBlockPosTmp = tmpShipBlockPos.get()
+
+        for (ship in level.shipObjectWorld.loadedShips.getIntersecting(queryAabb, level.dimensionId)) {
+            val state = getState(level, ship.id) ?: continue
+            val shipTransform = getQueryTransform(ship)
+
+            shipTransform.worldToShip.transformPosition(worldPos, shipPosTmp)
+            shipBlockPosTmp.set(Mth.floor(shipPosTmp.x), Mth.floor(shipPosTmp.y), Mth.floor(shipPosTmp.z))
+
+            if (!isOpen(state, shipBlockPosTmp)) {
+                val openPos = findOpenShipBlockPosForPoint(level, state, shipPosTmp, shipBlockPosTmp) ?: continue
+                shipBlockPosTmp.set(openPos)
+            }
+
+            val shipFluid = level.getBlockState(shipBlockPosTmp).fluidState
+            if (!shipFluid.isEmpty) return shipFluid
+
+            if (!original.isEmpty && original.`is`(Fluids.WATER)) {
+                // We are inside a ship air pocket; treat world water as air.
+                if (isAirPocket(state, shipBlockPosTmp)) {
+                    return shipFluid
+                }
+            }
+        }
+
+        return original
+    }
+
+    @JvmStatic
+    fun overrideWaterFluidState(
+        level: Level,
+        worldX: Double,
+        worldY: Double,
+        worldZ: Double,
+        original: net.minecraft.world.level.material.FluidState,
+    ): net.minecraft.world.level.material.FluidState {
+        if (!VSGameConfig.COMMON.WATER_POCKETS.enableShipWaterPockets) return original
+        if (level.isBlockInShipyard(worldX, worldY, worldZ)) return original
+        if (!original.isEmpty && !original.`is`(Fluids.WATER)) return original
+
+        val worldBlockPos = BlockPos.containing(worldX, worldY, worldZ)
+        val queryAabb = tmpQueryAabb.get().apply {
+            minX = worldBlockPos.x.toDouble()
+            minY = worldBlockPos.y.toDouble()
+            minZ = worldBlockPos.z.toDouble()
+            maxX = (worldBlockPos.x + 1).toDouble()
+            maxY = (worldBlockPos.y + 1).toDouble()
+            maxZ = (worldBlockPos.z + 1).toDouble()
+        }
+        val worldPos = tmpWorldPos.get().set(worldX, worldY, worldZ)
+        val shipPosTmp = tmpShipPos.get()
+        val shipBlockPosTmp = tmpShipBlockPos.get()
+
+        for (ship in level.shipObjectWorld.loadedShips.getIntersecting(queryAabb, level.dimensionId)) {
+            val state = getState(level, ship.id) ?: continue
+            val shipTransform = getQueryTransform(ship)
+
+            shipTransform.worldToShip.transformPosition(worldPos, shipPosTmp)
+            shipBlockPosTmp.set(Mth.floor(shipPosTmp.x), Mth.floor(shipPosTmp.y), Mth.floor(shipPosTmp.z))
+
+            if (!isOpen(state, shipBlockPosTmp)) {
+                val openPos = findOpenShipBlockPosForPoint(level, state, shipPosTmp, shipBlockPosTmp) ?: continue
+                shipBlockPosTmp.set(openPos)
+            }
+
+            val shipFluid = level.getBlockState(shipBlockPosTmp).fluidState
+            if (!shipFluid.isEmpty) return shipFluid
+
+            if (!original.isEmpty && original.`is`(Fluids.WATER)) {
+                // We are inside a ship air pocket; treat world water as air.
+                if (isAirPocket(state, shipBlockPosTmp)) {
+                    return shipFluid
+                }
+            }
+        }
+
+        return original
+    }
+
+    private fun findOpenShipBlockPosForPoint(
+        level: Level,
+        state: ShipPocketState,
+        shipPos: Vector3d,
+        tmp: BlockPos.MutableBlockPos,
+    ): BlockPos.MutableBlockPos? {
+        val x = shipPos.x
+        val y = shipPos.y
+        val z = shipPos.z
+
+        if (isOpenAtShipPoint(state, x, y, z, tmp)) return tmp
+
+        val e = POINT_QUERY_EPS
+        for (dx in doubleArrayOf(-e, 0.0, e)) {
+            for (dy in doubleArrayOf(-e, 0.0, e)) {
+                for (dz in doubleArrayOf(-e, 0.0, e)) {
+                    if (dx == 0.0 && dy == 0.0 && dz == 0.0) continue
+                    if (isOpenAtShipPoint(state, x + dx, y + dy, z + dz, tmp)) return tmp
+                }
+            }
+        }
+
+        val baseX = Mth.floor(x)
+        val baseY = Mth.floor(y)
+        val baseZ = Mth.floor(z)
+
+        // If we're inside a water-blocking block space (doors/panes/walls/etc), try to use the collision shape to pick
+        // the open neighbor cell that the point can actually "exit" through. This avoids flickering at thin collision
+        // blocks like doors (player can be inside the same block coordinate, but only on one side of the plane).
+        run {
+            tmp.set(baseX, baseY, baseZ)
+            val bs = level.getBlockState(tmp)
+            val shape = bs.getCollisionShape(level, tmp)
+            if (!shape.isEmpty) {
+                val fx = (x - baseX.toDouble()).coerceIn(0.0, 1.0)
+                val fy = (y - baseY.toDouble()).coerceIn(0.0, 1.0)
+                val fz = (z - baseZ.toDouble()).coerceIn(0.0, 1.0)
+
+                val eps = 1e-4
+                val boxes: List<AABB> = shape.toAabbs()
+
+                fun contains(px: Double, py: Double, pz: Double): Boolean {
+                    for (box in boxes) {
+                        if (px >= box.minX && px <= box.maxX &&
+                            py >= box.minY && py <= box.maxY &&
+                            pz >= box.minZ && pz <= box.maxZ
+                        ) {
+                            return true
+                        }
+                    }
+                    return false
+                }
+
+                fun consider(dirX: Int, dirY: Int, dirZ: Int, sampleX: Double, sampleY: Double, sampleZ: Double, faceDist: Double,
+                    best: DoubleArray,
+                ) {
+                    if (contains(sampleX, sampleY, sampleZ)) return
+                    tmp.set(baseX + dirX, baseY + dirY, baseZ + dirZ)
+                    if (!isOpen(state, tmp)) return
+                    val interior = isInterior(state, tmp)
+                    if (faceDist < best[0] - 1e-12 || (faceDist <= best[0] + 1e-12 && interior && best[1] == 0.0)) {
+                        best[0] = faceDist
+                        best[1] = if (interior) 1.0 else 0.0
+                        best[2] = tmp.x.toDouble()
+                        best[3] = tmp.y.toDouble()
+                        best[4] = tmp.z.toDouble()
+                    }
+                }
+
+                val best = doubleArrayOf(Double.POSITIVE_INFINITY, 0.0, 0.0, 0.0, 0.0)
+
+                consider(-1, 0, 0, eps, fy, fz, fx, best) // west
+                consider(1, 0, 0, 1.0 - eps, fy, fz, 1.0 - fx, best) // east
+                consider(0, -1, 0, fx, eps, fz, fy, best) // down
+                consider(0, 1, 0, fx, 1.0 - eps, fz, 1.0 - fy, best) // up
+                consider(0, 0, -1, fx, fy, eps, fz, best) // north
+                consider(0, 0, 1, fx, fy, 1.0 - eps, 1.0 - fz, best) // south
+
+                if (best[0] != Double.POSITIVE_INFINITY) {
+                    tmp.set(best[2].toInt(), best[3].toInt(), best[4].toInt())
+                    return tmp
+                }
+            }
+        }
+
+        // Otherwise, fall back to finding the nearest open neighbor cell so entities/camera don't flicker between
+        // "in water" and "in air" near boundaries.
+        var bestDistSq = Double.POSITIVE_INFINITY
+        var bestX = 0
+        var bestY = 0
+        var bestZ = 0
+
+        for (dx in -1..1) {
+            val px = baseX + dx
+            val cx = px + 0.5
+            val ddx = x - cx
+            for (dy in -1..1) {
+                val py = baseY + dy
+                val cy = py + 0.5
+                val ddy = y - cy
+                for (dz in -1..1) {
+                    if (dx == 0 && dy == 0 && dz == 0) continue
+                    val pz = baseZ + dz
+                    tmp.set(px, py, pz)
+                    if (!isOpen(state, tmp)) continue
+
+                    val cz = pz + 0.5
+                    val ddz = z - cz
+                    val distSq = ddx * ddx + ddy * ddy + ddz * ddz
+
+                    if (distSq < bestDistSq - 1e-12) {
+                        bestDistSq = distSq
+                        bestX = px
+                        bestY = py
+                        bestZ = pz
+                    }
+                }
+            }
+        }
+
+        if (bestDistSq != Double.POSITIVE_INFINITY) {
+            tmp.set(bestX, bestY, bestZ)
+            return tmp
+        }
+
+        return null
+    }
+
+    private fun isOpenAtShipPoint(
+        state: ShipPocketState,
+        x: Double,
+        y: Double,
+        z: Double,
+        tmp: BlockPos.MutableBlockPos,
+    ): Boolean {
+        tmp.set(Mth.floor(x), Mth.floor(y), Mth.floor(z))
+        return isOpen(state, tmp)
+    }
+
+    private fun getState(level: Level, shipId: Long): ShipPocketState? {
+        val map = if (level.isClientSide) clientStates else serverStates
+        return map[level.dimensionId]?.get(shipId)
+    }
+
+    private fun isInterior(state: ShipPocketState, shipPos: BlockPos): Boolean {
+        val lx = shipPos.x - state.minX
+        val ly = shipPos.y - state.minY
+        val lz = shipPos.z - state.minZ
+        if (lx !in 0 until state.sizeX || ly !in 0 until state.sizeY || lz !in 0 until state.sizeZ) return false
+        val idx = indexOf(state, lx, ly, lz)
+        return state.interior.get(idx)
+    }
+
+    private fun isOpen(state: ShipPocketState, shipPos: BlockPos): Boolean {
+        val lx = shipPos.x - state.minX
+        val ly = shipPos.y - state.minY
+        val lz = shipPos.z - state.minZ
+        if (lx !in 0 until state.sizeX || ly !in 0 until state.sizeY || lz !in 0 until state.sizeZ) return false
+        val idx = indexOf(state, lx, ly, lz)
+        return state.open.get(idx)
+    }
+
+    private fun isAirPocket(state: ShipPocketState, shipPos: BlockPos): Boolean {
+        val lx = shipPos.x - state.minX
+        val ly = shipPos.y - state.minY
+        val lz = shipPos.z - state.minZ
+        if (lx !in 0 until state.sizeX || ly !in 0 until state.sizeY || lz !in 0 until state.sizeZ) return false
+        val idx = indexOf(state, lx, ly, lz)
+        return state.open.get(idx) && !state.waterReachable.get(idx)
+    }
+
+    private fun indexOf(state: ShipPocketState, lx: Int, ly: Int, lz: Int): Int =
+        lx + state.sizeX * (ly + state.sizeY * lz)
+
+    private fun posFromIndex(state: ShipPocketState, idx: Int, out: BlockPos.MutableBlockPos): BlockPos.MutableBlockPos {
+        val sx = state.sizeX
+        val sy = state.sizeY
+        val lx = idx % sx
+        val t = idx / sx
+        val ly = t % sy
+        val lz = t / sy
+        return out.set(state.minX + lx, state.minY + ly, state.minZ + lz)
+    }
+
+    private fun getQueryTransform(ship: Ship): ShipTransform {
+        return if (ship is ClientShip) ship.renderTransform else ship.transform
+    }
+
+    private fun recomputeState(
+        level: Level,
+        ship: LoadedShip,
+        state: ShipPocketState,
+        minX: Int,
+        minY: Int,
+        minZ: Int,
+        sizeX: Int,
+        sizeY: Int,
+        sizeZ: Int,
+    ) {
+        state.minX = minX
+        state.minY = minY
+        state.minZ = minZ
+        state.sizeX = sizeX
+        state.sizeY = sizeY
+        state.sizeZ = sizeZ
+
+        val volume = sizeX * sizeY * sizeZ
+        val open = BitSet(volume)
+        val flooded = if (level.isClientSide) state.flooded else BitSet(volume)
+        val materialized = if (level.isClientSide) state.materializedWater else BitSet(volume)
+
+        val pos = BlockPos.MutableBlockPos()
+
+        var idx = 0
+        for (z in 0 until sizeZ) {
+            for (y in 0 until sizeY) {
+                for (x in 0 until sizeX) {
+                    pos.set(minX + x, minY + y, minZ + z)
+                    val bs = level.getBlockState(pos)
+
+                    if (!blocksWater(level, pos, bs)) {
+                        open.set(idx)
+                    }
+
+                    if (!level.isClientSide) {
+                        val fluidState = bs.fluidState
+                        if (!fluidState.isEmpty && fluidState.`is`(Fluids.WATER)) {
+                            flooded.set(idx)
+                            if (bs.block == Blocks.WATER) {
+                                materialized.set(idx)
+                            }
+                        }
+                    }
+
+                    idx++
+                }
+            }
+        }
+
+        val exterior = floodFillFromBoundary(open, sizeX, sizeY, sizeZ)
+        val interior = BitSet(volume).apply {
+            or(open)
+            andNot(exterior)
+        }
+
+        state.open = open
+        state.interior = interior
+        state.waterReachable = BitSet(volume)
+        if (!level.isClientSide) {
+            state.flooded = flooded
+            state.materializedWater = materialized
+        }
+
+        state.dirty = false
+    }
+
+    private fun computeWaterReachable(
+        level: Level,
+        state: ShipPocketState,
+        shipTransform: ShipTransform,
+    ): BitSet {
+        val open = state.open
+        val out = state.waterReachable
+        out.clear()
+        if (open.isEmpty) return out
+
+        val sizeX = state.sizeX
+        val sizeY = state.sizeY
+        val sizeZ = state.sizeZ
+        val volume = sizeX * sizeY * sizeZ
+
+        var queue = tmpFloodQueue.get()
+        if (queue.size < volume) {
+            queue = IntArray(volume)
+            tmpFloodQueue.set(queue)
+        }
+        var head = 0
+        var tail = 0
+
+        val worldPosTmp = Vector3d()
+        val shipPosTmp = Vector3d()
+        val shipBlockPos = BlockPos.MutableBlockPos()
+        val worldBlockPos = BlockPos.MutableBlockPos()
+
+        fun shipCellSubmerged(idx: Int): Boolean {
+            posFromIndex(state, idx, shipBlockPos)
+            return isShipCellSubmergedInWorldWater(level, shipTransform, shipBlockPos, shipPosTmp, worldPosTmp, worldBlockPos)
+        }
+
+        fun tryEnqueue(idx: Int) {
+            if (!open.get(idx) || out.get(idx)) return
+            if (!shipCellSubmerged(idx)) return
+            out.set(idx)
+            queue[tail++] = idx
+        }
+
+        // Seed from boundary open cells that are submerged in world water; then flood-fill through submerged open cells.
+        forEachBoundaryIndex(sizeX, sizeY, sizeZ) { idx -> tryEnqueue(idx) }
+
+        val strideY = sizeX
+        val strideZ = sizeX * sizeY
+
+        while (head < tail) {
+            val idx = queue[head++]
+
+            val lx = idx % sizeX
+            val t = idx / sizeX
+            val ly = t % sizeY
+            val lz = t / sizeY
+
+            if (lx > 0) tryEnqueue(idx - 1)
+            if (lx + 1 < sizeX) tryEnqueue(idx + 1)
+            if (ly > 0) tryEnqueue(idx - strideY)
+            if (ly + 1 < sizeY) tryEnqueue(idx + strideY)
+            if (lz > 0) tryEnqueue(idx - strideZ)
+            if (lz + 1 < sizeZ) tryEnqueue(idx + strideZ)
+        }
+
+        return out
+    }
+
+    private fun updateFlooding(level: ServerLevel, ship: LoadedShip, state: ShipPocketState, shipTransform: ShipTransform) {
+        val open = state.open
+        val interior = state.interior
+        val flooded = state.flooded
+        val materialized = state.materializedWater
+        if (open.isEmpty && flooded.isEmpty && materialized.isEmpty) return
+
+        val pos = BlockPos.MutableBlockPos()
+
+        // Remove materialized water blocks that are not in a watertight interior *and* are reachable by world water.
+        // This keeps player-placed water in (dry) air pockets, while still preventing shipyard water from existing
+        // in outside-of-ship spaces that are connected to the ocean.
+        val toRemove = materialized.clone() as BitSet
+        toRemove.andNot(interior)
+        toRemove.and(state.waterReachable)
+        applyBlockChanges(level, state, toRemove, toWater = false, pos = pos)
+
+        // Compute newly flooded cells from outside water contact (waterline-aware).
+        val externalWet = state.waterReachable
+
+        // Compute newly flooded cells from existing water inside the ship.
+        val internalWet = floodFillFromSeedsSubmerged(level, shipTransform, state, materialized)
+
+        flooded.or(externalWet)
+        flooded.or(internalWet)
+
+        // Materialize water blocks for flooded interior cells.
+        val toAdd = flooded.clone() as BitSet
+        toAdd.and(interior)
+        toAdd.andNot(materialized)
+        applyBlockChanges(level, state, toAdd, toWater = true, pos = pos, shipTransform = shipTransform)
+    }
+
+    private fun floodFillFromSeedsSubmerged(
+        level: Level,
+        shipTransform: ShipTransform,
+        state: ShipPocketState,
+        seeds: BitSet,
+    ): BitSet {
+        val sizeX = state.sizeX
+        val sizeY = state.sizeY
+        val sizeZ = state.sizeZ
+        val volume = sizeX * sizeY * sizeZ
+
+        val open = state.open
+        if (open.isEmpty || seeds.isEmpty) return BitSet()
+
+        val visited = BitSet(volume)
+        var queue = tmpFloodQueue.get()
+        if (queue.size < volume) {
+            queue = IntArray(volume)
+            tmpFloodQueue.set(queue)
+        }
+        var head = 0
+        var tail = 0
+
+        val worldPosTmp = Vector3d()
+        val shipPosTmp = Vector3d()
+        val shipBlockPos = BlockPos.MutableBlockPos()
+        val worldBlockPos = BlockPos.MutableBlockPos()
+
+        fun shipCellSubmerged(idx: Int): Boolean {
+            posFromIndex(state, idx, shipBlockPos)
+            return isShipCellSubmergedInWorldWater(level, shipTransform, shipBlockPos, shipPosTmp, worldPosTmp, worldBlockPos)
+        }
+
+        fun tryEnqueue(idx: Int, requireSubmerged: Boolean) {
+            if (!open.get(idx) || visited.get(idx)) return
+            if (requireSubmerged && !shipCellSubmerged(idx)) return
+            visited.set(idx)
+            queue[tail++] = idx
+        }
+
+        var idx = seeds.nextSetBit(0)
+        while (idx >= 0) {
+            // Always seed from existing materialized water, even if it's above the waterline.
+            tryEnqueue(idx, requireSubmerged = false)
+            idx = seeds.nextSetBit(idx + 1)
+        }
+
+        val strideY = sizeX
+        val strideZ = sizeX * sizeY
+
+        while (head < tail) {
+            val cur = queue[head++]
+
+            val lx = cur % sizeX
+            val t = cur / sizeX
+            val ly = t % sizeY
+            val lz = t / sizeY
+
+            // Spread only through submerged open cells to prevent water rising above the external waterline.
+            if (lx > 0) tryEnqueue(cur - 1, requireSubmerged = true)
+            if (lx + 1 < sizeX) tryEnqueue(cur + 1, requireSubmerged = true)
+            if (ly > 0) tryEnqueue(cur - strideY, requireSubmerged = true)
+            if (ly + 1 < sizeY) tryEnqueue(cur + strideY, requireSubmerged = true)
+            if (lz > 0) tryEnqueue(cur - strideZ, requireSubmerged = true)
+            if (lz + 1 < sizeZ) tryEnqueue(cur + strideZ, requireSubmerged = true)
+        }
+
+        return visited
+    }
+
+    private fun applyBlockChanges(
+        level: ServerLevel,
+        state: ShipPocketState,
+        indices: BitSet,
+        toWater: Boolean,
+        pos: BlockPos.MutableBlockPos,
+        shipTransform: ShipTransform? = null,
+    ) {
+        if (indices.isEmpty) return
+
+        val flags = 11 // 1 (block update) + 2 (send to clients) + 8 (force rerender)
+
+        val worldPosTmp = Vector3d()
+        val shipPosTmp = Vector3d()
+        val worldBlockPos = BlockPos.MutableBlockPos()
+
+        applyingInternalUpdates = true
+        try {
+            var idx = indices.nextSetBit(0)
+            while (idx >= 0) {
+                posFromIndex(state, idx, pos)
+
+                val current = level.getBlockState(pos)
+                if (toWater) {
+                    if (current.isAir) {
+                        if (shipTransform != null && !isShipCellSubmergedInWorldWater(
+                                level,
+                                shipTransform,
+                                pos,
+                                shipPosTmp,
+                                worldPosTmp,
+                                worldBlockPos
+                            )
+                        ) {
+                            idx = indices.nextSetBit(idx + 1)
+                            continue
+                        }
+                        level.setBlock(pos, Blocks.WATER.defaultBlockState(), flags)
+                        state.materializedWater.set(idx)
+                    }
+                } else {
+                    if (current.block == Blocks.WATER) {
+                        level.setBlock(pos, Blocks.AIR.defaultBlockState(), flags)
+                        state.materializedWater.clear(idx)
+                    }
+                }
+
+                idx = indices.nextSetBit(idx + 1)
+            }
+        } finally {
+            applyingInternalUpdates = false
+        }
+    }
+
+    private fun isShipCellSubmergedInWorldWater(
+        level: Level,
+        shipTransform: ShipTransform,
+        shipBlockPos: BlockPos,
+        shipPosTmp: Vector3d,
+        worldPosTmp: Vector3d,
+        worldBlockPos: BlockPos.MutableBlockPos,
+    ): Boolean {
+        val epsCorner = 1e-4
+        val epsY = 1e-5
+
+        fun sample(shipX: Double, shipY: Double, shipZ: Double): Boolean {
+            shipPosTmp.set(shipX, shipY, shipZ)
+            shipTransform.shipToWorld.transformPosition(shipPosTmp, worldPosTmp)
+
+            val wx = Mth.floor(worldPosTmp.x)
+            val wy = Mth.floor(worldPosTmp.y)
+            val wz = Mth.floor(worldPosTmp.z)
+            worldBlockPos.set(wx, wy, wz)
+
+            val worldFluid = level.getFluidState(worldBlockPos)
+            if (worldFluid.isEmpty || !worldFluid.`is`(Fluids.WATER)) return false
+            if (worldFluid.isSource) return true
+
+            val height = worldFluid.getHeight(level, worldBlockPos).toDouble()
+            val localY = worldPosTmp.y - wy.toDouble()
+            return localY <= height + epsY
+        }
+
+        val x0 = shipBlockPos.x.toDouble()
+        val y0 = shipBlockPos.y.toDouble()
+        val z0 = shipBlockPos.z.toDouble()
+
+        // Fast path: check the cell center first.
+        shipPosTmp.set(x0 + 0.5, y0 + 0.5, z0 + 0.5)
+        shipTransform.shipToWorld.transformPosition(shipPosTmp, worldPosTmp)
+        val centerWx = Mth.floor(worldPosTmp.x)
+        val centerWy = Mth.floor(worldPosTmp.y)
+        val centerWz = Mth.floor(worldPosTmp.z)
+        worldBlockPos.set(centerWx, centerWy, centerWz)
+        val centerFluid = level.getFluidState(worldBlockPos)
+
+        if (!centerFluid.isEmpty && centerFluid.`is`(Fluids.WATER)) {
+            if (centerFluid.isSource) return true
+            val height = centerFluid.getHeight(level, worldBlockPos).toDouble()
+            val localY = worldPosTmp.y - centerWy.toDouble()
+            if (localY <= height + epsY) return true
+        }
+
+        // Near the waterline / with rotation, the cell center can be above water while a corner is submerged.
+        val lo = epsCorner
+        val hi = 1.0 - epsCorner
+        if (sample(x0 + lo, y0 + lo, z0 + lo)) return true
+        if (sample(x0 + hi, y0 + lo, z0 + lo)) return true
+        if (sample(x0 + lo, y0 + hi, z0 + lo)) return true
+        if (sample(x0 + hi, y0 + hi, z0 + lo)) return true
+        if (sample(x0 + lo, y0 + lo, z0 + hi)) return true
+        if (sample(x0 + hi, y0 + lo, z0 + hi)) return true
+        if (sample(x0 + lo, y0 + hi, z0 + hi)) return true
+        if (sample(x0 + hi, y0 + hi, z0 + hi)) return true
+
+        return false
+    }
+
+    private fun floodFillFromBoundary(open: BitSet, sizeX: Int, sizeY: Int, sizeZ: Int): BitSet {
+        val volume = sizeX * sizeY * sizeZ
+        val visited = BitSet(volume)
+        val queue = IntArray(volume)
+        var head = 0
+        var tail = 0
+
+        fun tryEnqueue(idx: Int) {
+            if (!open.get(idx) || visited.get(idx)) return
+            visited.set(idx)
+            queue[tail++] = idx
+        }
+
+        forEachBoundaryIndex(sizeX, sizeY, sizeZ) { idx -> tryEnqueue(idx) }
+
+        val strideY = sizeX
+        val strideZ = sizeX * sizeY
+
+        while (head < tail) {
+            val idx = queue[head++]
+
+            val lx = idx % sizeX
+            val t = idx / sizeX
+            val ly = t % sizeY
+            val lz = t / sizeY
+
+            if (lx > 0) tryEnqueue(idx - 1)
+            if (lx + 1 < sizeX) tryEnqueue(idx + 1)
+            if (ly > 0) tryEnqueue(idx - strideY)
+            if (ly + 1 < sizeY) tryEnqueue(idx + strideY)
+            if (lz > 0) tryEnqueue(idx - strideZ)
+            if (lz + 1 < sizeZ) tryEnqueue(idx + strideZ)
+        }
+
+        return visited
+    }
+
+    private fun floodFillFromSeeds(open: BitSet, sizeX: Int, sizeY: Int, sizeZ: Int, seeds: BitSet): BitSet {
+        val volume = sizeX * sizeY * sizeZ
+        val visited = BitSet(volume)
+        val queue = IntArray(volume)
+        var head = 0
+        var tail = 0
+
+        var idx = seeds.nextSetBit(0)
+        while (idx >= 0) {
+            if (open.get(idx)) {
+                visited.set(idx)
+                queue[tail++] = idx
+            }
+            idx = seeds.nextSetBit(idx + 1)
+        }
+
+        val strideY = sizeX
+        val strideZ = sizeX * sizeY
+
+        fun tryEnqueue(i: Int) {
+            if (!open.get(i) || visited.get(i)) return
+            visited.set(i)
+            queue[tail++] = i
+        }
+
+        while (head < tail) {
+            val cur = queue[head++]
+
+            val lx = cur % sizeX
+            val t = cur / sizeX
+            val ly = t % sizeY
+            val lz = t / sizeY
+
+            if (lx > 0) tryEnqueue(cur - 1)
+            if (lx + 1 < sizeX) tryEnqueue(cur + 1)
+            if (ly > 0) tryEnqueue(cur - strideY)
+            if (ly + 1 < sizeY) tryEnqueue(cur + strideY)
+            if (lz > 0) tryEnqueue(cur - strideZ)
+            if (lz + 1 < sizeZ) tryEnqueue(cur + strideZ)
+        }
+
+        return visited
+    }
+
+    private fun floodFillFromBoundaryWater(level: Level, ship: LoadedShip, state: ShipPocketState): BitSet {
+        val sizeX = state.sizeX
+        val sizeY = state.sizeY
+        val sizeZ = state.sizeZ
+        val volume = sizeX * sizeY * sizeZ
+
+        val open = state.open
+        val visited = BitSet(volume)
+        val queue = IntArray(volume)
+        var head = 0
+        var tail = 0
+
+        val shipTransform = getQueryTransform(ship)
+        val worldPosTmp = Vector3d()
+        val shipPosTmp = Vector3d()
+        val shipBlockPos = BlockPos.MutableBlockPos()
+
+        fun shipCellInWorldWater(idx: Int): Boolean {
+            posFromIndex(state, idx, shipBlockPos)
+
+            shipPosTmp.set(shipBlockPos.x + 0.5, shipBlockPos.y + 0.5, shipBlockPos.z + 0.5)
+            shipTransform.shipToWorld.transformPosition(shipPosTmp, worldPosTmp)
+
+            val worldBlockPos = BlockPos.containing(worldPosTmp.x, worldPosTmp.y, worldPosTmp.z)
+            return level.getFluidState(worldBlockPos).`is`(Fluids.WATER)
+        }
+
+        fun tryEnqueue(idx: Int) {
+            if (!open.get(idx) || visited.get(idx)) return
+            if (!shipCellInWorldWater(idx)) return
+            visited.set(idx)
+            queue[tail++] = idx
+        }
+
+        forEachBoundaryIndex(sizeX, sizeY, sizeZ) { idx -> tryEnqueue(idx) }
+
+        val strideY = sizeX
+        val strideZ = sizeX * sizeY
+
+        fun trySpread(idx: Int) {
+            if (!open.get(idx) || visited.get(idx)) return
+            visited.set(idx)
+            queue[tail++] = idx
+        }
+
+        while (head < tail) {
+            val idx = queue[head++]
+
+            val lx = idx % sizeX
+            val t = idx / sizeX
+            val ly = t % sizeY
+            val lz = t / sizeY
+
+            if (lx > 0) trySpread(idx - 1)
+            if (lx + 1 < sizeX) trySpread(idx + 1)
+            if (ly > 0) trySpread(idx - strideY)
+            if (ly + 1 < sizeY) trySpread(idx + strideY)
+            if (lz > 0) trySpread(idx - strideZ)
+            if (lz + 1 < sizeZ) trySpread(idx + strideZ)
+        }
+
+        return visited
+    }
+
+    private fun forEachBoundaryIndex(sizeX: Int, sizeY: Int, sizeZ: Int, cb: (Int) -> Unit) {
+        fun idx(lx: Int, ly: Int, lz: Int) = lx + sizeX * (ly + sizeY * lz)
+
+        for (y in 0 until sizeY) {
+            for (x in 0 until sizeX) {
+                cb(idx(x, y, 0))
+                cb(idx(x, y, sizeZ - 1))
+            }
+        }
+        for (z in 0 until sizeZ) {
+            for (x in 0 until sizeX) {
+                cb(idx(x, 0, z))
+                cb(idx(x, sizeY - 1, z))
+            }
+        }
+        for (z in 0 until sizeZ) {
+            for (y in 0 until sizeY) {
+                cb(idx(0, y, z))
+                cb(idx(sizeX - 1, y, z))
+            }
+        }
+    }
+
+    private fun blocksWater(level: Level, pos: BlockPos, state: BlockState): Boolean {
+        val block = state.block
+
+        if (state.isAir) return false
+
+        when (block) {
+            is DoorBlock -> return !state.getValue(BlockStateProperties.OPEN)
+            is TrapDoorBlock -> return !state.getValue(BlockStateProperties.OPEN)
+            is FenceGateBlock -> return false
+            is FenceBlock -> return false
+            is SlabBlock -> return false
+            is StairBlock -> {
+                val shape = state.getValue(BlockStateProperties.STAIRS_SHAPE)
+                return shape != StairsShape.OUTER_LEFT && shape != StairsShape.OUTER_RIGHT
+            }
+            is IronBarsBlock -> {
+                if (block == Blocks.IRON_BARS) return false
+                val north = state.getValue(BlockStateProperties.NORTH)
+                val south = state.getValue(BlockStateProperties.SOUTH)
+                val east = state.getValue(BlockStateProperties.EAST)
+                val west = state.getValue(BlockStateProperties.WEST)
+                val seals = (north && south) || (east && west)
+                return seals
+            }
+            is WallBlock -> {
+                val north = state.getValue(BlockStateProperties.NORTH_WALL) != WallSide.NONE
+                val south = state.getValue(BlockStateProperties.SOUTH_WALL) != WallSide.NONE
+                val east = state.getValue(BlockStateProperties.EAST_WALL) != WallSide.NONE
+                val west = state.getValue(BlockStateProperties.WEST_WALL) != WallSide.NONE
+                val seals = (north && south) || (east && west)
+                return seals
+            }
+        }
+
+        // If you can normally walk through it (plants, etc), it leaks.
+        if (state.getCollisionShape(level, pos).isEmpty) return false
+
+        // Default: only treat full collision blocks as watertight.
+        return state.isCollisionShapeFullBlock(level, pos)
+    }
+}

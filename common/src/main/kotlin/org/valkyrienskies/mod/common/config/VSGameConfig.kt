@@ -286,12 +286,23 @@ object VSGameConfig {
         @ConfigCategory(title = "Advanced")
         val ADVANCED = Advanced()
 
+        @JvmField
+        @ConfigCategory(title = "Water Pockets")
+        val WATER_POCKETS = WaterPockets()
+
         class Advanced { // Debug configs that may be either side
             @ConfigEntry(
                 description = "Renders mob pathfinding nodes. Must be set on client and server to work. " +
                     "Requires the system property -Dorg.valkyrienskies.render_pathfinding=true"
             )
             var renderPathfinding = false // Requires ValkyrienCommonMixinConfigPlugin.PATH_FINDING_DEBUG to be true
+        }
+
+        class WaterPockets {
+            @ConfigEntry(
+                description = "Enables ship water/air pockets (submarines). Must be enabled on both client and server."
+            )
+            var enableShipWaterPockets = true
         }
     }
 }

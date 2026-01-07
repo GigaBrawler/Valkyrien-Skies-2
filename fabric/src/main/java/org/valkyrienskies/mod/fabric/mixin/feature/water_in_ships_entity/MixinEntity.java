@@ -12,6 +12,7 @@ import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
@@ -30,6 +31,9 @@ import org.spongepowered.asm.mixin.injection.Slice;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import org.valkyrienskies.mod.common.VSGameUtilsKt;
+import org.valkyrienskies.mod.common.config.VSGameConfig;
+import org.valkyrienskies.mod.common.feature.ship_water_pockets.ShipWaterPocketManager;
+import org.valkyrienskies.mod.mixinducks.feature.ship_water_pockets.ShipWaterPocketEntityDuck;
 
 @Mixin(Entity.class)
 public abstract class MixinEntity {
@@ -56,6 +60,9 @@ public abstract class MixinEntity {
 
     @Unique
     private boolean isShipWater = false;
+
+    @Unique
+    private boolean valkyrienskies$ignoreWorldWaterInAirPocket = false;
 
     /**
      * used to replace updateFluidHeightAndDoFluidPushing aABB in ship context
@@ -143,6 +150,9 @@ public abstract class MixinEntity {
         valkyrienskies$fluidPushNumber = numberPush;
         valkyrienskies$fluidPushRet = bl2;
         valkyrienskies$fluidPushVec = instance;
+        if (VSGameConfig.COMMON.WATER_POCKETS.getEnableShipWaterPockets()) {
+            return instance.length();
+        }
         VSGameUtilsKt.transformFromWorldToNearbyShipsAndWorld(level, aabb, (shipAabb) -> {
             valkyrienskies$fluidPushAABB = shipAabb; // enable ship context
             valkyrienskies$fluidPushRet = valkyrienskies$fluidPushRet || this.updateFluidHeightAndDoFluidPushing(tagKey, d);
@@ -187,9 +197,18 @@ public abstract class MixinEntity {
     )
     private FluidState getFluidStateRedirect(final Level level, final BlockPos blockPos,
         final Operation<FluidState> getFluidState) {
-        final FluidState[] fluidState = {getFluidState.call(level, blockPos)};
+        final FluidState original = getFluidState.call(level, blockPos);
         isShipWater = false;
-        if (fluidState[0].isEmpty()) {
+        if (VSGameConfig.COMMON.WATER_POCKETS.getEnableShipWaterPockets()) {
+            final double eyeY = this.getEyeY() - 0.1111111119389534;
+            final FluidState overridden =
+                ShipWaterPocketManager.overrideWaterFluidState(level, this.getX(), eyeY, this.getZ(), original);
+            isShipWater = overridden != original && !overridden.isEmpty();
+            return overridden;
+        }
+
+        if (original.isEmpty()) {
+            final FluidState[] fluidState = {original};
 
             final double d = this.getEyeY() - 0.1111111119389534;
 
@@ -202,8 +221,44 @@ public abstract class MixinEntity {
                     fluidState[0] = getFluidState.call(level, BlockPos.containing(x, y, z));
                 });
             isShipWater = true;
+            return fluidState[0];
         }
-        return fluidState[0];
+
+        return original;
+    }
+
+    @Inject(
+        method = "updateFluidHeightAndDoFluidPushing",
+        at = @At("HEAD")
+    )
+    private void vs$setupWaterPocketFluidPushOverride(final TagKey<Fluid> tagKey, final double d,
+        final CallbackInfoReturnable<Boolean> cir) {
+        valkyrienskies$ignoreWorldWaterInAirPocket = false;
+        if (!VSGameConfig.COMMON.WATER_POCKETS.getEnableShipWaterPockets()) return;
+        if (inShipContext()) return;
+
+        valkyrienskies$ignoreWorldWaterInAirPocket =
+            ((ShipWaterPocketEntityDuck) (Object) this).vs$isInShipAirPocketForWorldWater();
+    }
+
+    @WrapOperation(
+        at = @At(value = "INVOKE",
+            target = "Lnet/minecraft/world/level/Level;getFluidState(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/material/FluidState;"),
+        method = "updateFluidHeightAndDoFluidPushing"
+    )
+    private FluidState overrideFluidStateRedirect(final Level level, final BlockPos blockPos,
+        final Operation<FluidState> getFluidState) {
+        final FluidState original = getFluidState.call(level, blockPos);
+        if (inShipContext()) {
+            return original;
+        }
+        if (!VSGameConfig.COMMON.WATER_POCKETS.getEnableShipWaterPockets()) return original;
+
+        if (valkyrienskies$ignoreWorldWaterInAirPocket && !original.isEmpty() && original.is(Fluids.WATER)) {
+            return Fluids.EMPTY.defaultFluidState();
+        }
+
+        return ShipWaterPocketManager.overrideWaterFluidState(level, blockPos, original);
     }
 
     @WrapOperation(

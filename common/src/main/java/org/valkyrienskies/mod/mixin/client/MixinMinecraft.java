@@ -22,12 +22,15 @@ import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.valkyrienskies.core.api.ships.ClientShip;
 import org.valkyrienskies.core.internal.world.VsiClientShipWorld;
 import org.valkyrienskies.core.internal.world.VsiPipeline;
 import org.valkyrienskies.mod.common.IShipObjectWorldClientCreator;
 import org.valkyrienskies.mod.common.IShipObjectWorldClientProvider;
 import org.valkyrienskies.mod.common.IShipObjectWorldServerProvider;
 import org.valkyrienskies.mod.common.ValkyrienSkiesMod;
+import org.valkyrienskies.mod.client.feature.ship_water_pockets.ShipWaterPocketWorldWaterMaskRenderer;
+import org.valkyrienskies.mod.common.feature.ship_water_pockets.ShipWaterPocketManager;
 import org.valkyrienskies.mod.common.util.EntityDragger;
 import org.valkyrienskies.mod.mixinducks.client.MinecraftDuck;
 
@@ -49,6 +52,9 @@ public abstract class MixinMinecraft
 
     @Shadow
     public ClientLevel level;
+
+    @Shadow
+    public LocalPlayer player;
 
     @Unique
     private HitResult originalCrosshairTarget;
@@ -112,6 +118,7 @@ public abstract class MixinMinecraft
             shipObjectWorld.tickNetworking(getConnection().getConnection().getRemoteAddress());
             shipObjectWorld.postTick();
             EntityDragger.INSTANCE.dragEntitiesWithShips(level.entitiesForRendering(), false);
+            ShipWaterPocketManager.tickClientLevel(level);
         }
     }
 
@@ -168,5 +175,6 @@ public abstract class MixinMinecraft
         if (shipObjectWorld != null) {
             deleteShipObjectWorldClient();
         }
+        ShipWaterPocketWorldWaterMaskRenderer.clear();
     }
 }

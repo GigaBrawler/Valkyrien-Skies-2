@@ -10,6 +10,8 @@ import net.minecraft.world.level.LevelReader;
 import net.minecraft.world.level.block.FireBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.IntegerProperty;
+import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.Fluids;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -18,6 +20,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.valkyrienskies.mod.common.VSGameUtilsKt;
+import org.valkyrienskies.mod.common.feature.ship_water_pockets.ShipWaterPocketManager;
 
 @Mixin(FireBlock.class)
 public abstract class FireMixin {
@@ -28,6 +31,17 @@ public abstract class FireMixin {
     @Shadow
     @Final
     public static IntegerProperty AGE;
+
+    @Unique
+    private static boolean vs$isWaterExtinguishingFire(final Level level, final BlockPos pos) {
+        if (!level.isWaterAt(pos)) return false;
+
+        final FluidState original = level.getFluidState(pos);
+        if (original.isEmpty() || !original.is(Fluids.WATER)) return true;
+
+        final FluidState overridden = ShipWaterPocketManager.overrideWaterFluidState(level, pos, original);
+        return !overridden.isEmpty() && overridden.is(Fluids.WATER);
+    }
 
     @Inject(method = "tick", at = @At("TAIL"))
     public void fireTickMixin(BlockState state, ServerLevel level, BlockPos pos,
@@ -46,7 +60,7 @@ public abstract class FireMixin {
 
             final BlockPos newPos = BlockPos.containing(x, y, z);
 
-            if (level.isWaterAt(newPos)) {
+            if (vs$isWaterExtinguishingFire(level, newPos)) {
                 level.removeBlock(pos, false);
             }
 
@@ -106,7 +120,7 @@ public abstract class FireMixin {
         VSGameUtilsKt.transformToNearbyShipsAndWorld(level, origX, origY, origZ, 1, (x, y, z) -> {
 
             final BlockPos newPos = BlockPos.containing(x, y, z);
-            if (level.isWaterAt(newPos)) {
+            if (vs$isWaterExtinguishingFire(level, newPos)) {
                 level.removeBlock(pos, false);
             }
         });

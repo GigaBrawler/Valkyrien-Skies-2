@@ -10,6 +10,7 @@ import org.valkyrienskies.mod.compat.SodiumCompat;
 import me.jellysquid.mods.sodium.client.render.SodiumWorldRenderer;
 import me.jellysquid.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSectionManager;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.RenderType;
 
 @Mixin(value = SodiumWorldRenderer.class, remap = false, priority = 1100)

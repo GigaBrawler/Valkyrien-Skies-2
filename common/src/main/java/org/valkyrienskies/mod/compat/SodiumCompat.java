@@ -2,6 +2,7 @@ package org.valkyrienskies.mod.compat;
 
 import me.jellysquid.mods.sodium.client.gl.device.CommandList;
 import me.jellysquid.mods.sodium.client.gl.device.RenderDevice;
+import me.jellysquid.mods.sodium.client.render.SodiumWorldRenderer;
 import me.jellysquid.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSectionManager;
 import me.jellysquid.mods.sodium.client.render.chunk.map.ChunkStatus;
@@ -37,6 +38,16 @@ public class SodiumCompat {
     public static void onChunkRemoved(final ClientLevel level, final int x, final int z) {
         if (ValkyrienCommonMixinConfigPlugin.getVSRenderer() == VSRenderer.SODIUM) {
             ChunkTrackerHolder.get(level).onChunkStatusRemoved(x, z, ChunkStatus.FLAG_HAS_BLOCK_DATA);
+        }
+    }
+
+    public static void scheduleRebuildForBlockArea(final int minX, final int minY, final int minZ, final int maxX,
+        final int maxY, final int maxZ, final boolean important) {
+        if (ValkyrienCommonMixinConfigPlugin.getVSRenderer() == VSRenderer.SODIUM) {
+            final SodiumWorldRenderer worldRenderer = SodiumWorldRenderer.instanceNullable();
+            if (worldRenderer != null) {
+                worldRenderer.scheduleRebuildForBlockArea(minX, minY, minZ, maxX, maxY, maxZ, important);
+            }
         }
     }
 
