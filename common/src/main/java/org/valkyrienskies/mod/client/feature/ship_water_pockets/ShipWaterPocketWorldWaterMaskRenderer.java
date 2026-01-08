@@ -33,8 +33,10 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
 
     private ShipWaterPocketWorldWaterMaskRenderer() {}
 
-    private static final double Z_FIGHT_OFFSET = 0.001;
     private static final float DEPTH_BIAS_SCALE = 0.9995f;
+    private static final double DEPTH_BIAS_ABSOLUTE_ABOVE_WATER = 0.001;
+    private static final double DEPTH_BIAS_ABSOLUTE_BELOW_WATER = 0.25;
+    private static final double DEPTH_BIAS_MAX_FRACTION_OF_DISTANCE = 0.5;
     private static final int SURFACE_UPDATE_INTERVAL_TICKS = 20;
 
     private static final int[][] EDGES = {
@@ -42,6 +44,23 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
         {4, 5}, {5, 6}, {6, 7}, {7, 4},
         {0, 4}, {1, 5}, {2, 6}, {3, 7}
     };
+
+    private static final class RenderTemps {
+        private final Vector3d nShip = new Vector3d();
+        private final Vector3d tmp0 = new Vector3d();
+        private final Vector3d tmp1 = new Vector3d();
+        private final Vector3d tmpCorner = new Vector3d();
+        private final Vector3d[] cubeWorld = new Vector3d[] {
+            new Vector3d(), new Vector3d(), new Vector3d(), new Vector3d(),
+            new Vector3d(), new Vector3d(), new Vector3d(), new Vector3d()
+        };
+        private final double[] ptsX = new double[12];
+        private final double[] ptsZ = new double[12];
+        private final double[] angles = new double[12];
+        private final int[] order = new int[12];
+    }
+
+    private static final ThreadLocal<RenderTemps> RENDER_TEMPS = ThreadLocal.withInitial(RenderTemps::new);
 
     private static final class CachedSurface {
         private double y;
@@ -84,18 +103,16 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
         final var poseMatrix = poseStack.last().pose();
 
         // Reusable temporaries to avoid allocations.
-        final Vector3d nShip = new Vector3d();
-        final Vector3d tmp0 = new Vector3d();
-        final Vector3d tmp1 = new Vector3d();
-        final Vector3d tmpCorner = new Vector3d();
-        final Vector3d[] cubeWorld = new Vector3d[] {
-            new Vector3d(), new Vector3d(), new Vector3d(), new Vector3d(),
-            new Vector3d(), new Vector3d(), new Vector3d(), new Vector3d()
-        };
-        final double[] ptsX = new double[12];
-        final double[] ptsZ = new double[12];
-        final double[] angles = new double[12];
-        final int[] order = new int[12];
+        final RenderTemps temps = RENDER_TEMPS.get();
+        final Vector3d nShip = temps.nShip;
+        final Vector3d tmp0 = temps.tmp0;
+        final Vector3d tmp1 = temps.tmp1;
+        final Vector3d tmpCorner = temps.tmpCorner;
+        final Vector3d[] cubeWorld = temps.cubeWorld;
+        final double[] ptsX = temps.ptsX;
+        final double[] ptsZ = temps.ptsZ;
+        final double[] angles = temps.angles;
+        final int[] order = temps.order;
 
         for (final LoadedShip ship : VSGameUtilsKt.getShipObjectWorld(level).getLoadedShips()) {
             final long shipId = ship.getId();
@@ -157,7 +174,7 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
             if (open == null || waterReachable == null) continue;
 
             final boolean cameraBelow = cameraPos.y < waterSurfaceY;
-            final float yOffset = (float) (cameraBelow ? -Z_FIGHT_OFFSET - 0.001 : Z_FIGHT_OFFSET);
+            final double depthBias = cameraBelow ? DEPTH_BIAS_ABSOLUTE_BELOW_WATER : DEPTH_BIAS_ABSOLUTE_ABOVE_WATER;
 
             final int strideY = sizeX;
             final int strideZ = sizeX * sizeY;
@@ -211,7 +228,7 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
                         if (!isAirPocketOrAdjacent(open, waterReachable, idx, lx, ly, lz, sizeX, sizeY, sizeZ, strideY, strideZ)) continue;
 
                         // Slice this ship-space cube [x0,x1]×[sy,sy+1]×[z0,z1] against the world water plane.
-                        if (!emitCubeSlice(consumer, poseMatrix, shipToWorld, cameraPos, waterSurfaceY, yOffset,
+                        if (!emitCubeSlice(consumer, poseMatrix, shipToWorld, cameraPos, waterSurfaceY, depthBias,
                             x0i, sy, z0i, tmpCorner, cubeWorld, ptsX, ptsZ, angles, order, cameraBelow)) {
                             continue;
                         }
@@ -276,10 +293,14 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
 
     private static Double detectTopWaterSurfaceYColumn(final Level level, final double x, final double z,
         final int minY, final int maxY) {
+        final int bx = Mth.floor(x);
+        final int bz = Mth.floor(z);
+        final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(bx, 0, bz);
+        final BlockPos.MutableBlockPos posAbove = new BlockPos.MutableBlockPos(bx, 0, bz);
         for (int y = maxY; y >= minY; y--) {
-            final BlockPos pos = BlockPos.containing(x, y, z);
+            pos.setY(y);
             final FluidState fluid = level.getFluidState(pos);
-            if (!fluid.isEmpty() && fluid.is(Fluids.WATER) && level.isEmptyBlock(pos.above())) {
+            if (!fluid.isEmpty() && fluid.is(Fluids.WATER) && level.isEmptyBlock(posAbove.setY(y + 1))) {
                 return y + (double) fluid.getHeight(level, pos);
             }
         }
@@ -293,7 +314,7 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
         final Matrix4dc shipToWorld,
         final Vec3 cameraPos,
         final double yPlane,
-        final float yOffset,
+        final double depthBias,
         final int x0,
         final int y0,
         final int z0,
@@ -403,7 +424,7 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
             }
         }
 
-        final float vy = (float) (yPlane - cameraPos.y) + yOffset;
+        final double vy = (yPlane - cameraPos.y);
         final int base = order[0];
 
         for (int i = 1; i + 1 < count; i++) {
@@ -411,20 +432,35 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
             final int p2 = order[i + 1];
 
             // RenderType.waterMask() uses QUADS. Emit a degenerate quad per triangle so we can still fan-triangulate.
-            emitVertex(consumer, poseMatrix, ptsX[base], vy, ptsZ[base], cameraPos);
-            emitVertex(consumer, poseMatrix, ptsX[p1], vy, ptsZ[p1], cameraPos);
-            emitVertex(consumer, poseMatrix, ptsX[p2], vy, ptsZ[p2], cameraPos);
-            emitVertex(consumer, poseMatrix, ptsX[p2], vy, ptsZ[p2], cameraPos);
+            emitVertex(consumer, poseMatrix, ptsX[base], vy, ptsZ[base], cameraPos, depthBias);
+            emitVertex(consumer, poseMatrix, ptsX[p1], vy, ptsZ[p1], cameraPos, depthBias);
+            emitVertex(consumer, poseMatrix, ptsX[p2], vy, ptsZ[p2], cameraPos, depthBias);
+            emitVertex(consumer, poseMatrix, ptsX[p2], vy, ptsZ[p2], cameraPos, depthBias);
         }
 
         return true;
     }
 
     private static void emitVertex(final VertexConsumer consumer, final org.joml.Matrix4f poseMatrix,
-        final double wx, final float relY, final double wz, final Vec3 cameraPos) {
-        final float rx = (float) (wx - cameraPos.x);
-        final float rz = (float) (wz - cameraPos.z);
-        consumer.vertex(poseMatrix, rx * DEPTH_BIAS_SCALE, relY * DEPTH_BIAS_SCALE, rz * DEPTH_BIAS_SCALE).endVertex();
+        final double wx, final double relY, final double wz, final Vec3 cameraPos, final double depthBias) {
+        final double rx = (wx - cameraPos.x);
+        final double rz = (wz - cameraPos.z);
+
+        final double distSq = rx * rx + relY * relY + rz * rz;
+        if (!(distSq > 0.0) || !Double.isFinite(distSq)) {
+            consumer.vertex(poseMatrix, 0.0f, 0.0f, 0.0f).endVertex();
+            return;
+        }
+
+        final double dist = Math.sqrt(distSq);
+        final double maxBias = dist * DEPTH_BIAS_MAX_FRACTION_OF_DISTANCE;
+        final double absBiasClamped = Math.min(depthBias, maxBias);
+
+        // Push the mask towards the camera along the view ray so its screen-space footprint stays identical.
+        final double absScale = (dist - absBiasClamped) / dist;
+        final double scale = Math.min(absScale, (double) DEPTH_BIAS_SCALE);
+
+        consumer.vertex(poseMatrix, (float) (rx * scale), (float) (relY * scale), (float) (rz * scale)).endVertex();
     }
 
     /**
