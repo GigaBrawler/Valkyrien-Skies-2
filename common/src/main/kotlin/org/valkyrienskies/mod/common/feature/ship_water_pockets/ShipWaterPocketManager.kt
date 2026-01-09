@@ -145,19 +145,31 @@ object ShipWaterPocketManager {
             val state = states.computeIfAbsent(ship.id) { ShipPocketState() }
 
             val aabb = ship.shipAABB ?: return@forEach
-            val sizeX = aabb.maxX() - aabb.minX()
-            val sizeY = aabb.maxY() - aabb.minY()
-            val sizeZ = aabb.maxZ() - aabb.minZ()
+            val minX = aabb.minX()
+            val minY = aabb.minY()
+            val minZ = aabb.minZ()
+            val sizeX = aabb.maxX() - minX
+            val sizeY = aabb.maxY() - minY
+            val sizeZ = aabb.maxZ() - minZ
             val volume = sizeX.toLong() * sizeY.toLong() * sizeZ.toLong()
             if (volume <= 0 || volume > MAX_SIM_VOLUME.toLong()) {
                 state.dirty = false
                 return@forEach
             }
 
-            if (state.dirty || state.sizeX != sizeX || state.sizeY != sizeY || state.sizeZ != sizeZ ||
-                state.minX != aabb.minX() || state.minY != aabb.minY() || state.minZ != aabb.minZ()
-            ) {
-                recomputeState(level, ship, state, aabb.minX(), aabb.minY(), aabb.minZ(), sizeX, sizeY, sizeZ)
+            val needsRecompute =
+                state.dirty || state.sizeX != sizeX || state.sizeY != sizeY || state.sizeZ != sizeZ ||
+                    state.minX != minX || state.minY != minY || state.minZ != minZ
+            if (needsRecompute) {
+                // When (re)loading a ship, the shipyard chunks can arrive a few ticks after the ship object itself.
+                // If we recompute while those chunks are still unloaded, `getBlockState` returns air everywhere, which
+                // makes the ship appear entirely "open" and disables all air pockets until another shipyard block
+                // update marks the ship dirty again.
+                if (!areShipyardChunksLoaded(level, minX, minY, minZ, sizeX, sizeY, sizeZ)) {
+                    state.dirty = true
+                } else {
+                    recomputeState(level, ship, state, minX, minY, minZ, sizeX, sizeY, sizeZ)
+                }
             }
 
             val now = level.gameTime
@@ -168,6 +180,22 @@ object ShipWaterPocketManager {
         }
 
         states.keys.removeIf { !loadedShipIds.contains(it) }
+    }
+
+    private fun areShipyardChunksLoaded(
+        level: Level,
+        minX: Int,
+        minY: Int,
+        minZ: Int,
+        sizeX: Int,
+        sizeY: Int,
+        sizeZ: Int,
+    ): Boolean {
+        if (sizeX <= 0 || sizeY <= 0 || sizeZ <= 0) return false
+        val maxX = minX + sizeX - 1
+        val maxY = minY + sizeY - 1
+        val maxZ = minZ + sizeZ - 1
+        return level.hasChunksAt(BlockPos(minX, minY, minZ), BlockPos(maxX, maxY, maxZ))
     }
 
     data class ClientWaterReachableSnapshot(

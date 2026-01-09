@@ -251,6 +251,7 @@
     "feature.render_pathfinding.MixinDebugRenderer",
     "feature.render_ship_debug_bb.MixinDebugRenderer",
     "feature.seamless_copy.MixinClientPacketListener",
+    "feature.ship_water_pockets.MixinClientPacketListener",
     "feature.ship_debug_overlay.MixinDebugScreenOverlay",
     "feature.shipyard_entities.MixinClientLevel",
     "feature.shipyard_entities.MixinEntityRenderDispatcher",
