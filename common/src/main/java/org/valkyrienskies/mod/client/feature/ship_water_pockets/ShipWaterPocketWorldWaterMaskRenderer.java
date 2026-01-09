@@ -1,5 +1,6 @@
 package org.valkyrienskies.mod.client.feature.ship_water_pockets;
 
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import java.util.Arrays;
@@ -35,7 +36,7 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
 
     private static final float DEPTH_BIAS_SCALE = 0.9995f;
     private static final double DEPTH_BIAS_ABSOLUTE_ABOVE_WATER = 0.001;
-    private static final double DEPTH_BIAS_ABSOLUTE_BELOW_WATER = 0.25;
+    private static final double DEPTH_BIAS_ABSOLUTE_BELOW_WATER = 1.5;
     private static final double DEPTH_BIAS_MAX_FRACTION_OF_DISTANCE = 0.5;
     private static final int SURFACE_UPDATE_INTERVAL_TICKS = 20;
 
@@ -50,6 +51,73 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
         private final Vector3d tmp0 = new Vector3d();
         private final Vector3d tmp1 = new Vector3d();
         private final Vector3d tmpCorner = new Vector3d();
+
+        private final org.joml.Matrix4f projection = new org.joml.Matrix4f();
+        private final org.joml.Matrix4f invProjection = new org.joml.Matrix4f();
+
+        private final org.joml.Matrix4f modelViewPose = new org.joml.Matrix4f();
+        private final org.joml.Matrix4f invModelViewPose = new org.joml.Matrix4f();
+
+        private float projM00;
+        private float projM01;
+        private float projM02;
+        private float projM03;
+        private float projM10;
+        private float projM11;
+        private float projM12;
+        private float projM13;
+        private float projM20;
+        private float projM21;
+        private float projM22;
+        private float projM23;
+        private float projM30;
+        private float projM31;
+        private float projM32;
+        private float projM33;
+
+        private float invProjM00;
+        private float invProjM01;
+        private float invProjM02;
+        private float invProjM03;
+        private float invProjM10;
+        private float invProjM11;
+        private float invProjM12;
+        private float invProjM13;
+        private float invProjM20;
+        private float invProjM21;
+        private float invProjM22;
+        private float invProjM23;
+        private float invProjM30;
+        private float invProjM31;
+        private float invProjM32;
+        private float invProjM33;
+
+        private float mvpM00;
+        private float mvpM01;
+        private float mvpM02;
+        private float mvpM10;
+        private float mvpM11;
+        private float mvpM12;
+        private float mvpM20;
+        private float mvpM21;
+        private float mvpM22;
+        private float mvpTX;
+        private float mvpTY;
+        private float mvpTZ;
+
+        private float invMvpM00;
+        private float invMvpM01;
+        private float invMvpM02;
+        private float invMvpM10;
+        private float invMvpM11;
+        private float invMvpM12;
+        private float invMvpM20;
+        private float invMvpM21;
+        private float invMvpM22;
+        private float invMvpTX;
+        private float invMvpTY;
+        private float invMvpTZ;
+
         private final Vector3d[] cubeWorld = new Vector3d[] {
             new Vector3d(), new Vector3d(), new Vector3d(), new Vector3d(),
             new Vector3d(), new Vector3d(), new Vector3d(), new Vector3d()
@@ -100,10 +168,81 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
         final long gameTime = level.getGameTime();
 
         final VertexConsumer consumer = bufferSource.getBuffer(RenderType.waterMask());
-        final var poseMatrix = poseStack.last().pose();
 
         // Reusable temporaries to avoid allocations.
         final RenderTemps temps = RENDER_TEMPS.get();
+
+        final var poseMatrix = poseStack.last().pose();
+
+        // Vanilla view bobbing is folded into the projection matrix (see GameRenderer#bobView). To keep the mask
+        // perfectly stable with view bobbing on/off (and with/without shader pipelines that may implement bobbing
+        // differently), we treat ProjectionMat as part of the transform when applying the depth bias.
+        temps.projection.set(RenderSystem.getProjectionMatrix());
+        temps.invProjection.set(temps.projection).invert();
+
+        temps.modelViewPose.set(RenderSystem.getModelViewMatrix()).mul(poseMatrix);
+        temps.invModelViewPose.set(temps.modelViewPose).invert();
+
+        temps.projM00 = temps.projection.m00();
+        temps.projM01 = temps.projection.m01();
+        temps.projM02 = temps.projection.m02();
+        temps.projM03 = temps.projection.m03();
+        temps.projM10 = temps.projection.m10();
+        temps.projM11 = temps.projection.m11();
+        temps.projM12 = temps.projection.m12();
+        temps.projM13 = temps.projection.m13();
+        temps.projM20 = temps.projection.m20();
+        temps.projM21 = temps.projection.m21();
+        temps.projM22 = temps.projection.m22();
+        temps.projM23 = temps.projection.m23();
+        temps.projM30 = temps.projection.m30();
+        temps.projM31 = temps.projection.m31();
+        temps.projM32 = temps.projection.m32();
+        temps.projM33 = temps.projection.m33();
+
+        temps.invProjM00 = temps.invProjection.m00();
+        temps.invProjM01 = temps.invProjection.m01();
+        temps.invProjM02 = temps.invProjection.m02();
+        temps.invProjM03 = temps.invProjection.m03();
+        temps.invProjM10 = temps.invProjection.m10();
+        temps.invProjM11 = temps.invProjection.m11();
+        temps.invProjM12 = temps.invProjection.m12();
+        temps.invProjM13 = temps.invProjection.m13();
+        temps.invProjM20 = temps.invProjection.m20();
+        temps.invProjM21 = temps.invProjection.m21();
+        temps.invProjM22 = temps.invProjection.m22();
+        temps.invProjM23 = temps.invProjection.m23();
+        temps.invProjM30 = temps.invProjection.m30();
+        temps.invProjM31 = temps.invProjection.m31();
+        temps.invProjM32 = temps.invProjection.m32();
+        temps.invProjM33 = temps.invProjection.m33();
+
+        temps.mvpM00 = temps.modelViewPose.m00();
+        temps.mvpM01 = temps.modelViewPose.m01();
+        temps.mvpM02 = temps.modelViewPose.m02();
+        temps.mvpM10 = temps.modelViewPose.m10();
+        temps.mvpM11 = temps.modelViewPose.m11();
+        temps.mvpM12 = temps.modelViewPose.m12();
+        temps.mvpM20 = temps.modelViewPose.m20();
+        temps.mvpM21 = temps.modelViewPose.m21();
+        temps.mvpM22 = temps.modelViewPose.m22();
+        temps.mvpTX = temps.modelViewPose.m30();
+        temps.mvpTY = temps.modelViewPose.m31();
+        temps.mvpTZ = temps.modelViewPose.m32();
+
+        temps.invMvpM00 = temps.invModelViewPose.m00();
+        temps.invMvpM01 = temps.invModelViewPose.m01();
+        temps.invMvpM02 = temps.invModelViewPose.m02();
+        temps.invMvpM10 = temps.invModelViewPose.m10();
+        temps.invMvpM11 = temps.invModelViewPose.m11();
+        temps.invMvpM12 = temps.invModelViewPose.m12();
+        temps.invMvpM20 = temps.invModelViewPose.m20();
+        temps.invMvpM21 = temps.invModelViewPose.m21();
+        temps.invMvpM22 = temps.invModelViewPose.m22();
+        temps.invMvpTX = temps.invModelViewPose.m30();
+        temps.invMvpTY = temps.invModelViewPose.m31();
+        temps.invMvpTZ = temps.invModelViewPose.m32();
+
         final Vector3d nShip = temps.nShip;
         final Vector3d tmp0 = temps.tmp0;
         final Vector3d tmp1 = temps.tmp1;
@@ -228,7 +367,7 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
                         if (!isAirPocketOrAdjacent(open, waterReachable, idx, lx, ly, lz, sizeX, sizeY, sizeZ, strideY, strideZ)) continue;
 
                         // Slice this ship-space cube [x0,x1]×[sy,sy+1]×[z0,z1] against the world water plane.
-                        if (!emitCubeSlice(consumer, poseMatrix, shipToWorld, cameraPos, waterSurfaceY, depthBias,
+                        if (!emitCubeSlice(consumer, poseMatrix, temps, shipToWorld, cameraPos, waterSurfaceY, depthBias,
                             x0i, sy, z0i, tmpCorner, cubeWorld, ptsX, ptsZ, angles, order, cameraBelow)) {
                             continue;
                         }
@@ -311,6 +450,7 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
     private static boolean emitCubeSlice(
         final VertexConsumer consumer,
         final org.joml.Matrix4f poseMatrix,
+        final RenderTemps temps,
         final Matrix4dc shipToWorld,
         final Vec3 cameraPos,
         final double yPlane,
@@ -432,23 +572,32 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
             final int p2 = order[i + 1];
 
             // RenderType.waterMask() uses QUADS. Emit a degenerate quad per triangle so we can still fan-triangulate.
-            emitVertex(consumer, poseMatrix, ptsX[base], vy, ptsZ[base], cameraPos, depthBias);
-            emitVertex(consumer, poseMatrix, ptsX[p1], vy, ptsZ[p1], cameraPos, depthBias);
-            emitVertex(consumer, poseMatrix, ptsX[p2], vy, ptsZ[p2], cameraPos, depthBias);
-            emitVertex(consumer, poseMatrix, ptsX[p2], vy, ptsZ[p2], cameraPos, depthBias);
+            emitVertex(consumer, poseMatrix, temps, ptsX[base], vy, ptsZ[base], cameraPos, depthBias);
+            emitVertex(consumer, poseMatrix, temps, ptsX[p1], vy, ptsZ[p1], cameraPos, depthBias);
+            emitVertex(consumer, poseMatrix, temps, ptsX[p2], vy, ptsZ[p2], cameraPos, depthBias);
+            emitVertex(consumer, poseMatrix, temps, ptsX[p2], vy, ptsZ[p2], cameraPos, depthBias);
         }
 
         return true;
     }
 
     private static void emitVertex(final VertexConsumer consumer, final org.joml.Matrix4f poseMatrix,
-        final double wx, final double relY, final double wz, final Vec3 cameraPos, final double depthBias) {
-        final double rx = (wx - cameraPos.x);
-        final double rz = (wz - cameraPos.z);
+        final RenderTemps temps, final double wx, final double relY, final double wz, final Vec3 cameraPos,
+        final double depthBias) {
+        final float px = (float) (wx - cameraPos.x);
+        final float py = (float) relY;
+        final float pz = (float) (wz - cameraPos.z);
 
-        final double distSq = rx * rx + relY * relY + rz * rz;
+        // Apply the depth bias in clip-space Z (after projection) so its screen-space footprint stays identical.
+        // This avoids the subtle "breathing" you get when view bobbing adds a translation (vanilla folds bobbing into
+        // the projection matrix, so scaling in view space doesn't perfectly preserve NDC X/Y).
+        final float vx = temps.mvpM00 * px + temps.mvpM10 * py + temps.mvpM20 * pz + temps.mvpTX;
+        final float vy = temps.mvpM01 * px + temps.mvpM11 * py + temps.mvpM21 * pz + temps.mvpTY;
+        final float vz = temps.mvpM02 * px + temps.mvpM12 * py + temps.mvpM22 * pz + temps.mvpTZ;
+
+        final double distSq = (double) vx * vx + (double) vy * vy + (double) vz * vz;
         if (!(distSq > 0.0) || !Double.isFinite(distSq)) {
-            consumer.vertex(poseMatrix, 0.0f, 0.0f, 0.0f).endVertex();
+            consumer.vertex(poseMatrix, px, py, pz).endVertex();
             return;
         }
 
@@ -456,11 +605,52 @@ public final class ShipWaterPocketWorldWaterMaskRenderer {
         final double maxBias = dist * DEPTH_BIAS_MAX_FRACTION_OF_DISTANCE;
         final double absBiasClamped = Math.min(depthBias, maxBias);
 
-        // Push the mask towards the camera along the view ray so its screen-space footprint stays identical.
         final double absScale = (dist - absBiasClamped) / dist;
-        final double scale = Math.min(absScale, (double) DEPTH_BIAS_SCALE);
+        final float scale = (float) Math.min(absScale, (double) DEPTH_BIAS_SCALE);
+        final float vScaledX = vx * scale;
+        final float vScaledY = vy * scale;
+        final float vScaledZ = vz * scale;
 
-        consumer.vertex(poseMatrix, (float) (rx * scale), (float) (relY * scale), (float) (rz * scale)).endVertex();
+        // Clip-space (unbiased) position.
+        final float clipX = temps.projM00 * vx + temps.projM10 * vy + temps.projM20 * vz + temps.projM30;
+        final float clipY = temps.projM01 * vx + temps.projM11 * vy + temps.projM21 * vz + temps.projM31;
+        final float clipZ = temps.projM02 * vx + temps.projM12 * vy + temps.projM22 * vz + temps.projM32;
+        final float clipW = temps.projM03 * vx + temps.projM13 * vy + temps.projM23 * vz + temps.projM33;
+
+        // Clip-space Z/W after scaling along the view ray (used only to compute the desired depth).
+        final float clipScaledZ = temps.projM02 * vScaledX + temps.projM12 * vScaledY + temps.projM22 * vScaledZ + temps.projM32;
+        final float clipScaledW = temps.projM03 * vScaledX + temps.projM13 * vScaledY + temps.projM23 * vScaledZ + temps.projM33;
+
+        if (!(clipW != 0.0f) || !(clipScaledW != 0.0f)) {
+            consumer.vertex(poseMatrix, px, py, pz).endVertex();
+            return;
+        }
+
+        // Keep NDC X/Y identical by only changing clip-space Z (keep X/Y/W untouched).
+        final float ndcZScaled = clipScaledZ / clipScaledW;
+        final float biasedClipZ = ndcZScaled * clipW;
+
+        // Back-transform from clip -> view -> local coordinates.
+        final float viewX = temps.invProjM00 * clipX + temps.invProjM10 * clipY + temps.invProjM20 * biasedClipZ + temps.invProjM30 * clipW;
+        final float viewY = temps.invProjM01 * clipX + temps.invProjM11 * clipY + temps.invProjM21 * biasedClipZ + temps.invProjM31 * clipW;
+        final float viewZ = temps.invProjM02 * clipX + temps.invProjM12 * clipY + temps.invProjM22 * biasedClipZ + temps.invProjM32 * clipW;
+        final float viewW = temps.invProjM03 * clipX + temps.invProjM13 * clipY + temps.invProjM23 * biasedClipZ + temps.invProjM33 * clipW;
+
+        if (!(viewW != 0.0f) || !Float.isFinite(viewW)) {
+            consumer.vertex(poseMatrix, px, py, pz).endVertex();
+            return;
+        }
+
+        final float localX = temps.invMvpM00 * viewX + temps.invMvpM10 * viewY + temps.invMvpM20 * viewZ + temps.invMvpTX * viewW;
+        final float localY = temps.invMvpM01 * viewX + temps.invMvpM11 * viewY + temps.invMvpM21 * viewZ + temps.invMvpTY * viewW;
+        final float localZ = temps.invMvpM02 * viewX + temps.invMvpM12 * viewY + temps.invMvpM22 * viewZ + temps.invMvpTZ * viewW;
+
+        final float invW = 1.0f / viewW;
+        final float preX = localX * invW;
+        final float preY = localY * invW;
+        final float preZ = localZ * invW;
+
+        consumer.vertex(poseMatrix, preX, preY, preZ).endVertex();
     }
 
     /**
