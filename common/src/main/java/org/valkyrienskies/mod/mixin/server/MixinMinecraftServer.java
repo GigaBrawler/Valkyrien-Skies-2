@@ -47,6 +47,7 @@ import org.spongepowered.asm.mixin.injection.At.Shift;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.valkyrienskies.core.api.ships.LoadedServerShip;
+import org.valkyrienskies.core.api.ships.ServerShip;
 import org.valkyrienskies.core.api.ships.properties.IShipActiveChunksSet;
 import org.valkyrienskies.core.internal.VsiGameServer;
 import org.valkyrienskies.core.internal.ShipTeleportData;
@@ -60,6 +61,7 @@ import org.valkyrienskies.mod.common.VSGameUtilsKt;
 import org.valkyrienskies.mod.common.ValkyrienSkiesMod;
 import org.valkyrienskies.mod.common.config.DimensionParametersResolver;
 import org.valkyrienskies.mod.common.config.MassDatapackResolver;
+import org.valkyrienskies.mod.common.config.VSGameConfig;
 import org.valkyrienskies.mod.common.hooks.VSGameEvents;
 import org.valkyrienskies.mod.common.util.EntityDragger;
 import org.valkyrienskies.mod.common.util.ShipSettingsKt;
@@ -74,6 +76,9 @@ import org.valkyrienskies.mod.util.McMathUtilKt;
 
 @Mixin(MinecraftServer.class)
 public abstract class MixinMinecraftServer implements IShipObjectWorldServerProvider, VsiGameServer {
+    @Unique
+    private static final int VS$TICKS_PER_SECOND = 20;
+
     @Shadow
     private PlayerList playerList;
 
@@ -94,6 +99,9 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
 
     @Unique
     private final Map<String, ServerLevel> dimensionToLevelMap = new HashMap<>();
+
+    @Unique
+    private int vs$pendingUnstaticTicks = -1;
 
     @Inject(
         at = @At(value = "INVOKE", target = "Lnet/minecraft/server/MinecraftServer;initServer()Z"),
@@ -160,6 +168,12 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
 
         shipWorld = vsPipeline.getShipWorld();
         shipWorld.setGameServer(this);
+        final int startupShipStabilizationSeconds = Math.max(0, VSGameConfig.SERVER.getStartupShipStabilizationSeconds());
+        vs$pendingUnstaticTicks = startupShipStabilizationSeconds * VS$TICKS_PER_SECOND;
+        if (vs$pendingUnstaticTicks == 0) {
+            vs$unfreezeAllShipsWithZeroMotion();
+            vs$pendingUnstaticTicks = -1;
+        }
 
         VSGameEvents.INSTANCE.getRegistriesCompleted().emit(Unit.INSTANCE);
 
@@ -218,6 +232,10 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
         }
         loadedLevels = newLoadedLevels.keySet();
         // endregion
+
+        if (vs$pendingUnstaticTicks > 0 && --vs$pendingUnstaticTicks == 0) {
+            vs$unfreezeAllShipsWithZeroMotion();
+        }
 
         vsPipeline.preTickGame();
     }
@@ -424,9 +442,44 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
         at = @At("HEAD")
     )
     private void preStopServer(final CallbackInfo ci) {
+        vs$setAllShipsStatic(true);
+        vs$pendingUnstaticTicks = -1;
+
         if (vsPipeline != null) {
             vsPipeline.setDeleteResources(true);
             vsPipeline.setArePhysicsRunning(true);
+        }
+    }
+
+    @Unique
+    private void vs$setAllShipsStatic(final boolean isStatic) {
+        if (shipWorld == null) {
+            return;
+        }
+
+        for (final ServerShip ship : shipWorld.getAllShips()) {
+            ship.setStatic(isStatic);
+        }
+    }
+
+    @Unique
+    private void vs$unfreezeAllShipsWithZeroMotion() {
+        if (shipWorld == null) {
+            return;
+        }
+
+        for (final ServerShip ship : shipWorld.getAllShips()) {
+            final ShipTeleportData shipTeleportData = ValkyrienSkiesMod.getVsCore().newShipTeleportData(
+                ship.getTransform().getPositionInWorld(),
+                ship.getTransform().getShipToWorldRotation(),
+                new Vector3d(),
+                new Vector3d(),
+                ship.getChunkClaimDimension(),
+                null,
+                ship.getTransform().getPositionInShip()
+            );
+            shipWorld.teleportShip(ship, shipTeleportData);
+            ship.setStatic(false);
         }
     }
 

@@ -190,6 +190,11 @@ object VSGameConfig {
         var enableMovementChecks = false
 
         @ConfigEntry(
+            description = "Seconds to keep ships static after world startup before unfreezing them."
+        )
+        var startupShipStabilizationSeconds = 10
+
+        @ConfigEntry(
             description = "If true, when a player disconnects, their position on the ship is saved such that " +
                 "if the ship is moved, when they reconnect they will be teleported to the same position in the ship " +
                 "as they left, instead of being left behind."
