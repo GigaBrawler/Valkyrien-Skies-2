@@ -10,6 +10,8 @@ import org.valkyrienskies.core.internal.joints.VSJointAndId
 import org.valkyrienskies.core.internal.joints.VSJointId
 import org.valkyrienskies.core.internal.world.VsiPhysLevel
 import org.valkyrienskies.core.util.pollUntilEmpty
+import org.valkyrienskies.mod.common.ShipSavedData
+import org.valkyrienskies.mod.common.joints.JointPersistenceManager
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.function.Consumer
@@ -31,11 +33,17 @@ class GameToPhysicsAdapter {
 
     private val shipToJointIds = ConcurrentHashMap<Long, Set<Int>>()
     private val jointById = ConcurrentHashMap<Int, VSJoint>()
+    private val runtimeIdAliases = ConcurrentHashMap<Int, Int>()
+    private val persistentKeyToRuntimeId = ConcurrentHashMap<String, Int>()
+    private val runtimeIdToPersistentKey = ConcurrentHashMap<Int, String>()
 
     private val toBeStatic = ConcurrentLinkedQueue<Pair<ShipId, Boolean>>()
 
     private val enablePairs = ConcurrentLinkedQueue<Pair<ShipId, ShipId>>()
     private val disablePairs = ConcurrentLinkedQueue<Pair<ShipId, ShipId>>()
+
+    @Volatile
+    private var persistenceDimensionId: String? = null
 
 
     fun physTick(physLevel: PhysLevel, delta: Double) {
@@ -133,6 +141,15 @@ class GameToPhysicsAdapter {
 
         shipToJointIds.putAll((physLevel as VsiPhysLevel).getJointsByShipIds())
         jointById.putAll((physLevel as VsiPhysLevel).getAllJoints())
+        val activeJointIds = jointById.keys.toSet()
+        persistentKeyToRuntimeId.entries.removeIf { (_, runtimeId) ->
+            val resolvedRuntimeId = resolveRuntimeJointId(runtimeId)
+            !activeJointIds.contains(resolvedRuntimeId)
+        }
+        runtimeIdToPersistentKey.entries.removeIf { (runtimeId, _) ->
+            val resolvedRuntimeId = resolveRuntimeJointId(runtimeId)
+            !activeJointIds.contains(resolvedRuntimeId)
+        }
 
         // and finally... call the callbacks
         callbackQueue.forEach { (consumer, i) -> consumer.accept(i) }
@@ -261,14 +278,174 @@ class GameToPhysicsAdapter {
         toBeStatic.add(ship to b)
     }
 
+    fun configurePersistence(dimensionId: String) {
+        persistenceDimensionId = dimensionId
+    }
+
+    fun registerRuntimeAlias(legacyRuntimeId: Int, runtimeId: Int) {
+        if (legacyRuntimeId < 0 || runtimeId < 0 || legacyRuntimeId == runtimeId) {
+            return
+        }
+        runtimeIdAliases[legacyRuntimeId] = runtimeId
+    }
+
+    fun resolveRuntimeJointId(runtimeOrLegacyId: Int): Int {
+        if (runtimeOrLegacyId < 0) {
+            return runtimeOrLegacyId
+        }
+        val visited = HashSet<Int>()
+        var current = runtimeOrLegacyId
+        while (true) {
+            if (!visited.add(current)) {
+                break
+            }
+            val next = runtimeIdAliases[current] ?: break
+            current = next
+        }
+        return current
+    }
+
+    fun bindPersistentKey(persistentKey: String, runtimeId: Int) {
+        if (runtimeId < 0 || persistentKey.isBlank()) {
+            return
+        }
+        val resolvedRuntimeId = resolveRuntimeJointId(runtimeId)
+        persistentKeyToRuntimeId[persistentKey] = resolvedRuntimeId
+        runtimeIdToPersistentKey[resolvedRuntimeId] = persistentKey
+    }
+
+    fun unbindPersistentKey(persistentKey: String, runtimeId: Int? = null) {
+        val resolvedRuntimeId = runtimeId?.let(::resolveRuntimeJointId) ?: persistentKeyToRuntimeId[persistentKey]
+        if (resolvedRuntimeId != null) {
+            runtimeIdToPersistentKey.remove(resolvedRuntimeId)
+        }
+        persistentKeyToRuntimeId.remove(persistentKey)
+    }
+
+    fun getRuntimeIdForPersistentKey(persistentKey: String): Int? {
+        val runtimeId = persistentKeyToRuntimeId[persistentKey] ?: return null
+        val resolvedRuntimeId = resolveRuntimeJointId(runtimeId)
+        if (resolvedRuntimeId != runtimeId) {
+            bindPersistentKey(persistentKey, resolvedRuntimeId)
+        }
+        return resolvedRuntimeId
+    }
+
+    fun getPersistentKeyForRuntimeId(runtimeId: Int): String? {
+        val resolvedRuntimeId = resolveRuntimeJointId(runtimeId)
+        return runtimeIdToPersistentKey[resolvedRuntimeId] ?: runtimeIdToPersistentKey[runtimeId]
+    }
+
+    fun hasPersistentKeyBinding(persistentKey: String): Boolean {
+        return getRuntimeIdForPersistentKey(persistentKey) != null
+    }
+
+    fun getRuntimeIdAliasesSnapshot(): Map<Int, Int> = runtimeIdAliases.toMap()
+
+    fun getPersistentKeyBindingsSnapshot(): Map<String, Int> = persistentKeyToRuntimeId.toMap()
+
+    fun addJointPersistent(
+        joint: VSJoint,
+        ownerType: String? = null,
+        ownerRef: String? = null,
+        persistentKey: String? = null,
+        delay: Int = 0,
+        function: Consumer<VSJointId>
+    ) {
+        val dimensionId = persistenceDimensionId
+        if (dimensionId == null) {
+            addedJoints[joint to function] = delay
+            return
+        }
+
+        var resolvedPersistentKey = persistentKey?.takeIf { it.isNotBlank() }
+            ?: JointPersistenceManager.newPersistentKey()
+        resolvedPersistentKey = JointPersistenceManager.resolvePersistentKeyForOwner(
+            dimensionId,
+            resolvedPersistentKey,
+            ownerType,
+            ownerRef
+        )
+
+        val existingRuntimeId = JointPersistenceManager.findRestoredRuntimeIdForOwner(
+            dimensionId,
+            ownerType,
+            ownerRef,
+            this,
+            null
+        ) ?: getRuntimeIdForPersistentKey(resolvedPersistentKey)
+        if (existingRuntimeId != null && jointById.containsKey(resolveRuntimeJointId(existingRuntimeId))) {
+            JointPersistenceManager.upsertActiveJointDescriptor(
+                dimensionId = dimensionId,
+                persistentKey = resolvedPersistentKey,
+                joint = joint,
+                ownerType = ownerType,
+                ownerRef = ownerRef,
+                runtimeId = existingRuntimeId
+            )
+            bindPersistentKey(resolvedPersistentKey, existingRuntimeId)
+            function.accept(existingRuntimeId)
+            return
+        }
+
+        JointPersistenceManager.upsertActiveJointDescriptor(
+            dimensionId = dimensionId,
+            persistentKey = resolvedPersistentKey,
+            joint = joint,
+            ownerType = ownerType,
+            ownerRef = ownerRef,
+            runtimeId = getRuntimeIdForPersistentKey(resolvedPersistentKey)
+        )
+
+        val wrappedCallback = Consumer<VSJointId> { runtimeId ->
+            JointPersistenceManager.onAddResult(dimensionId, resolvedPersistentKey, runtimeId, this)
+            function.accept(resolveRuntimeJointId(runtimeId))
+        }
+        addedJoints[joint to wrappedCallback] = delay
+    }
+
+    fun restorePersistentJoint(descriptor: ShipSavedData.PersistentJointRecord, joint: VSJoint) {
+        addJointPersistent(
+            joint = joint,
+            ownerType = descriptor.ownerType,
+            ownerRef = descriptor.ownerRef,
+            persistentKey = descriptor.persistentKey,
+            delay = 0,
+            function = Consumer { _ -> }
+        )
+    }
+
     fun addJoint(joint: VSJoint, delay: Int = 0, function: Consumer<VSJointId>) {
-        addedJoints.put(joint to function, delay)
+        addJointPersistent(
+            joint = joint,
+            ownerType = null,
+            ownerRef = null,
+            persistentKey = null,
+            delay = delay,
+            function = function
+        )
     }
+
+    fun updateJointPersistent(runtimeOrLegacyId: VSJointId, joint: VSJoint) {
+        val resolvedRuntimeId = resolveRuntimeJointId(runtimeOrLegacyId)
+        updatedJoints.add(VSJointAndId(resolvedRuntimeId, joint))
+        val dimensionId = persistenceDimensionId ?: return
+        JointPersistenceManager.onRuntimeJointUpdated(dimensionId, resolvedRuntimeId, joint, this)
+    }
+
     fun updateJoint(jointAndId: VSJointAndId) {
-        updatedJoints.add(jointAndId)
+        updateJointPersistent(jointAndId.jointId, jointAndId.joint)
     }
+
+    fun removeJointPersistent(runtimeOrLegacyId: VSJointId) {
+        val resolvedRuntimeId = resolveRuntimeJointId(runtimeOrLegacyId)
+        deletedJoints.add(resolvedRuntimeId)
+        val dimensionId = persistenceDimensionId ?: return
+        JointPersistenceManager.onRuntimeJointRemoved(dimensionId, resolvedRuntimeId, this)
+    }
+
     fun removeJoint(jointId: VSJointId) {
-        deletedJoints.add(jointId)
+        removeJointPersistent(jointId)
     }
 
     /**

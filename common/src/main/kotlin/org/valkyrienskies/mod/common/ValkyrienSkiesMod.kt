@@ -34,6 +34,7 @@ import org.valkyrienskies.mod.common.blockentity.TestHingeBlockEntity
 import org.valkyrienskies.mod.common.blockentity.TestThrusterBlockEntity
 import org.valkyrienskies.mod.common.entity.ShipMountingEntity
 import org.valkyrienskies.mod.common.entity.VSPhysicsEntity
+import org.valkyrienskies.mod.common.joints.JointPersistenceManager
 import org.valkyrienskies.mod.common.jackson.BlockPosDeserializer
 import org.valkyrienskies.mod.common.jackson.BlockPosKeyDeserializer
 import org.valkyrienskies.mod.common.jackson.BlockPosKeySerializer
@@ -148,6 +149,7 @@ object ValkyrienSkiesMod {
             dimensionalGTPAs.forEach { dimensionId, gameTickForceApplier ->
                 if (event.world.dimension == dimensionId) {
                     gameTickForceApplier.physTick(event.world, event.delta)
+                    JointPersistenceManager.onPhysTick(dimensionId, event.world, gameTickForceApplier)
                 }
             }
             blockEntityPhysListeners.getOrPut(event.world.dimension, { ConcurrentHashMap() }).forEach { pos, infoPair ->
@@ -178,7 +180,9 @@ object ValkyrienSkiesMod {
 
     @JvmStatic
     fun getOrCreateGTPA(dimensionId: DimensionId): GameToPhysicsAdapter {
-        return dimensionalGTPAs.getOrPut(dimensionId) { GameToPhysicsAdapter() }
+        val adapter = dimensionalGTPAs.getOrPut(dimensionId) { GameToPhysicsAdapter() }
+        JointPersistenceManager.registerAdapter(dimensionId, adapter)
+        return adapter
     }
 
     fun addBlockEntityPhysTicker(

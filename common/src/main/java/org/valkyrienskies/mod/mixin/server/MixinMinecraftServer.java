@@ -65,6 +65,7 @@ import org.valkyrienskies.mod.common.config.DimensionParametersResolver;
 import org.valkyrienskies.mod.common.config.MassDatapackResolver;
 import org.valkyrienskies.mod.common.config.VSConfigUpdater;
 import org.valkyrienskies.mod.common.hooks.VSGameEvents;
+import org.valkyrienskies.mod.common.joints.JointPersistenceManager;
 import org.valkyrienskies.mod.common.util.EntityDragger;
 import org.valkyrienskies.mod.common.util.ShipSettingsKt;
 import org.valkyrienskies.mod.common.util.VSLevelChunk;
@@ -166,6 +167,7 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
         final ShipSavedData shipSavedData = overworld().getDataStorage()
             .computeIfAbsent(ShipSavedData::load, ShipSavedData.Companion::createEmpty, ShipSavedData.SAVED_DATA_ID);
         vs$shipSavedData = shipSavedData;
+        JointPersistenceManager.bootstrap(shipSavedData);
 
         // If there was an error deserializing, re-throw it here so that the game actually crashes.
         // We would prefer to crash the game here than allow the player keep playing with everything corrupted.
@@ -236,6 +238,7 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
             final String dimensionId = VSGameUtilsKt.getDimensionId(level);
             newLoadedLevels.put(dimensionId, level);
             dimensionToLevelMap.put(dimensionId, level);
+            ValkyrienSkiesMod.getOrCreateGTPA(dimensionId);
         }
         /*
         for (final var entry : newLoadedLevels.entrySet()) {
@@ -746,6 +749,7 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
         if (shipWorld != null) {
             shipWorld.setGameServer(null);
         }
+        JointPersistenceManager.clear();
         shipWorld = null;
         vsPipeline = null;
     }
