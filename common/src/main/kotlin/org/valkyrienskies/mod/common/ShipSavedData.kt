@@ -16,6 +16,8 @@ class ShipSavedData : SavedData() {
         private const val QUERYABLE_SHIP_DATA_NBT_KEY = "queryable_ship_data"
         private const val CHUNK_ALLOCATOR_NBT_KEY = "chunk_allocator"
         private const val PIPELINE_NBT_KEY = "vs_pipeline"
+        private const val STABILIZATION_PENDING_DYNAMIC_RESTORE_SHIP_IDS_NBT_KEY =
+            "stabilization_pending_dynamic_restore_ship_ids"
 
         fun createEmpty(): ShipSavedData {
             return ShipSavedData().apply { pipeline = vsCore.newPipeline() }
@@ -41,17 +43,42 @@ class ShipSavedData : SavedData() {
             } catch (ex: Exception) {
                 data.loadingException = ex
             }
+
+            data.shipsPendingDynamicRestoreShipIds +=
+                compoundTag.getLongArray(STABILIZATION_PENDING_DYNAMIC_RESTORE_SHIP_IDS_NBT_KEY).toList()
             return data
         }
     }
 
     lateinit var pipeline: VsiPipeline
 
+    private val shipsPendingDynamicRestoreShipIds: MutableSet<Long> = mutableSetOf()
+
     var loadingException: Throwable? = null
         private set
 
+    fun markPendingDynamicRestore(shipId: Long, pending: Boolean) {
+        if (pending) {
+            shipsPendingDynamicRestoreShipIds.add(shipId)
+        } else {
+            shipsPendingDynamicRestoreShipIds.remove(shipId)
+        }
+    }
+
+    fun isPendingDynamicRestore(shipId: Long): Boolean {
+        return shipsPendingDynamicRestoreShipIds.contains(shipId)
+    }
+
+    fun getPendingDynamicRestoreShipIds(): Set<Long> {
+        return shipsPendingDynamicRestoreShipIds
+    }
+
     override fun save(compoundTag: CompoundTag): CompoundTag {
         compoundTag.putByteArray(PIPELINE_NBT_KEY, vsCore.serializePipeline(pipeline))
+        compoundTag.putLongArray(
+            STABILIZATION_PENDING_DYNAMIC_RESTORE_SHIP_IDS_NBT_KEY,
+            shipsPendingDynamicRestoreShipIds.toLongArray()
+        )
 
         return compoundTag
     }

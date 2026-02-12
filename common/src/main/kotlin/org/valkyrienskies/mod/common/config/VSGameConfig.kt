@@ -159,6 +159,33 @@ object VSGameConfig {
             var shellRecoilMult = 500000.0
         }
 
+        @ConfigCategory(title = "Stabilization")
+        val Stabilization = STABILIZATION()
+
+        class STABILIZATION {
+            @ConfigEntry(
+                description = "Seconds to keep ships static before unfreezing them after startup and runtime proximity reloads."
+            )
+            var startupShipStabilizationSeconds = 30
+
+            @ConfigEntry(
+                description = "If true, send debug chat messages when startup/runtime stabilization changes a ship static state."
+            )
+            var stabilizationDebugMessages = false
+        }
+
+        var startupShipStabilizationSeconds: Int
+            get() = Stabilization.startupShipStabilizationSeconds
+            set(value) {
+                Stabilization.startupShipStabilizationSeconds = value
+            }
+
+        var stabilizationDebugMessages: Boolean
+            get() = Stabilization.stabilizationDebugMessages
+            set(value) {
+                Stabilization.stabilizationDebugMessages = value
+            }
+
 
         @ConfigEntry(
             description = "By default, the vanilla server prevents block interacts past a certain distance " +
@@ -188,11 +215,6 @@ object VSGameConfig {
                 "check. (it doesn't work very well anyway, don't worry)"
         )
         var enableMovementChecks = false
-
-        @ConfigEntry(
-            description = "Seconds to keep ships static after world startup before unfreezing them."
-        )
-        var startupShipStabilizationSeconds = 10
 
         @ConfigEntry(
             description = "If true, when a player disconnects, their position on the ship is saved such that " +

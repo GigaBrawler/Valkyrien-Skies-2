@@ -3,6 +3,7 @@ package org.valkyrienskies.mod.mixin.server;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -14,6 +15,7 @@ import net.minecraft.BlockUtil.FoundRectangle;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Direction.Axis;
+import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -61,7 +63,7 @@ import org.valkyrienskies.mod.common.VSGameUtilsKt;
 import org.valkyrienskies.mod.common.ValkyrienSkiesMod;
 import org.valkyrienskies.mod.common.config.DimensionParametersResolver;
 import org.valkyrienskies.mod.common.config.MassDatapackResolver;
-import org.valkyrienskies.mod.common.config.VSGameConfig;
+import org.valkyrienskies.mod.common.config.VSConfigUpdater;
 import org.valkyrienskies.mod.common.hooks.VSGameEvents;
 import org.valkyrienskies.mod.common.util.EntityDragger;
 import org.valkyrienskies.mod.common.util.ShipSettingsKt;
@@ -102,6 +104,18 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
 
     @Unique
     private int vs$pendingUnstaticTicks = -1;
+
+    @Unique
+    private int vs$lastObservedStabilizationDelayTicks = -1;
+
+    @Unique
+    private ShipSavedData vs$shipSavedData;
+
+    @Unique
+    private final Map<Long, Integer> vs$pendingLoadUnfreezeTicks = new HashMap<>();
+
+    @Unique
+    private final Set<Long> vs$pendingRuntimeLoadCandidates = new HashSet<>();
 
     @Inject(
         at = @At(value = "INVOKE", target = "Lnet/minecraft/server/MinecraftServer;initServer()Z"),
@@ -151,6 +165,7 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
         // Load ship data from the world storage
         final ShipSavedData shipSavedData = overworld().getDataStorage()
             .computeIfAbsent(ShipSavedData::load, ShipSavedData.Companion::createEmpty, ShipSavedData.SAVED_DATA_ID);
+        vs$shipSavedData = shipSavedData;
 
         // If there was an error deserializing, re-throw it here so that the game actually crashes.
         // We would prefer to crash the game here than allow the player keep playing with everything corrupted.
@@ -168,10 +183,13 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
 
         shipWorld = vsPipeline.getShipWorld();
         shipWorld.setGameServer(this);
-        final int startupShipStabilizationSeconds = Math.max(0, VSGameConfig.SERVER.getStartupShipStabilizationSeconds());
-        vs$pendingUnstaticTicks = startupShipStabilizationSeconds * VS$TICKS_PER_SECOND;
+        vs$pendingLoadUnfreezeTicks.clear();
+        vs$pendingRuntimeLoadCandidates.clear();
+
+        vs$pendingUnstaticTicks = vs$getStabilizationDelayTicks();
+        vs$lastObservedStabilizationDelayTicks = vs$pendingUnstaticTicks;
         if (vs$pendingUnstaticTicks == 0) {
-            vs$unfreezeAllShipsWithZeroMotion();
+            vs$unfreezeAllPendingShipsWithZeroMotion();
             vs$pendingUnstaticTicks = -1;
         }
 
@@ -203,6 +221,10 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
         at = @At("HEAD")
     )
     private void preTick(final CallbackInfo ci) {
+        if (shipWorld == null || vsPipeline == null) {
+            return;
+        }
+
         final Set<VsiPlayer> vsPlayers = playerList.getPlayers().stream()
             .map(VSGameUtilsKt::getPlayerWrapper).collect(Collectors.toSet());
 
@@ -233,11 +255,45 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
         loadedLevels = newLoadedLevels.keySet();
         // endregion
 
+        vsPipeline.preTickGame();
+
+        final int currentStabilizationDelayTicks = vs$getStabilizationDelayTicks();
+        vs$reapplyStabilizationDelayToPendingTimers(currentStabilizationDelayTicks);
+
         if (vs$pendingUnstaticTicks > 0 && --vs$pendingUnstaticTicks == 0) {
-            vs$unfreezeAllShipsWithZeroMotion();
+            vs$unfreezeAllPendingShipsWithZeroMotion();
+            vs$pendingUnstaticTicks = -1;
         }
 
-        vsPipeline.preTickGame();
+        if (!vs$pendingLoadUnfreezeTicks.isEmpty()) {
+            final Set<Long> loadedShipIdsThisTick = new HashSet<>();
+            shipWorld.getLoadedShips().forEach(ship -> loadedShipIdsThisTick.add(ship.getId()));
+
+            final Iterator<Map.Entry<Long, Integer>> pendingIterator = vs$pendingLoadUnfreezeTicks.entrySet().iterator();
+            while (pendingIterator.hasNext()) {
+                final Map.Entry<Long, Integer> pendingEntry = pendingIterator.next();
+                final int remainingTicks = pendingEntry.getValue() - 1;
+                if (remainingTicks > 0) {
+                    pendingEntry.setValue(remainingTicks);
+                    continue;
+                }
+
+                pendingIterator.remove();
+
+                final long shipId = pendingEntry.getKey();
+                if (!loadedShipIdsThisTick.contains(shipId)) {
+                    continue;
+                }
+                if (vs$shipSavedData == null || !vs$shipSavedData.isPendingDynamicRestore(shipId)) {
+                    continue;
+                }
+
+                final ServerShip loadedShip = shipWorld.getAllShips().getById(shipId);
+                if (loadedShip != null) {
+                    vs$unfreezeShipWithZeroMotion(loadedShip, true);
+                }
+            }
+        }
     }
 
     /**
@@ -252,7 +308,31 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
         )
     )
     private void preConnectionTick(final CallbackInfo ci) {
-        ChunkManagement.tickChunkLoading(shipWorld, MinecraftServer.class.cast(this));
+        if (shipWorld == null) {
+            return;
+        }
+
+        final ChunkManagement.RuntimeStabilizationTransitions runtimeTransitions =
+            ChunkManagement.tickChunkLoading(shipWorld, MinecraftServer.class.cast(this));
+        if (runtimeTransitions == null) {
+            return;
+        }
+
+        for (final Long shipId : runtimeTransitions.getRuntimeUnloadShipIds()) {
+            if (shipId != null) {
+                vs$handleRuntimeUnloadShip(shipId);
+            }
+        }
+
+        if (vs$shipSavedData == null) {
+            return;
+        }
+
+        for (final Long shipId : runtimeTransitions.getRuntimeWatchShipIds()) {
+            if (shipId != null && vs$shipSavedData.isPendingDynamicRestore(shipId)) {
+                vs$pendingRuntimeLoadCandidates.add(shipId);
+            }
+        }
     }
 
     @Shadow
@@ -266,7 +346,44 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
         at = @At("TAIL")
     )
     private void postTick(final CallbackInfo ci) {
+        if (vsPipeline == null || shipWorld == null) {
+            return;
+        }
+
         vsPipeline.postTickGame();
+
+        if (!vs$pendingRuntimeLoadCandidates.isEmpty() && vs$shipSavedData != null) {
+            final Map<Long, LoadedServerShip> loadedShipsById = vs$getLoadedShipsSnapshot();
+            final int stabilizationDelayTicks = vs$getStabilizationDelayTicks();
+            final Iterator<Long> candidateIterator = vs$pendingRuntimeLoadCandidates.iterator();
+            while (candidateIterator.hasNext()) {
+                final long shipId = candidateIterator.next();
+                if (!vs$shipSavedData.isPendingDynamicRestore(shipId)) {
+                    candidateIterator.remove();
+                    continue;
+                }
+
+                final LoadedServerShip loadedShip = loadedShipsById.get(shipId);
+                if (loadedShip == null) {
+                    continue;
+                }
+
+                if (!loadedShip.isStatic()) {
+                    loadedShip.setStatic(true);
+                    vs$sendRuntimeStabilizationMessage(shipId, true);
+                }
+
+                if (vs$pendingUnstaticTicks > 0) {
+                    continue;
+                }
+
+                if (!vs$pendingLoadUnfreezeTicks.containsKey(shipId)) {
+                    vs$scheduleOrExecuteRuntimeUnfreeze(loadedShip, stabilizationDelayTicks);
+                }
+                candidateIterator.remove();
+            }
+        }
+
         // Only drag entities after we have updated the ship positions
         for (final ServerLevel level : getAllLevels()) {
             EntityDragger.INSTANCE.dragEntitiesWithShips(level.getAllEntities(), false);
@@ -442,8 +559,15 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
         at = @At("HEAD")
     )
     private void preStopServer(final CallbackInfo ci) {
-        vs$setAllShipsStatic(true);
+        if (shipWorld != null) {
+            for (final ServerShip ship : shipWorld.getAllShips()) {
+                vs$freezeShipForStabilization(ship);
+            }
+        }
+
         vs$pendingUnstaticTicks = -1;
+        vs$pendingLoadUnfreezeTicks.clear();
+        vs$pendingRuntimeLoadCandidates.clear();
 
         if (vsPipeline != null) {
             vsPipeline.setDeleteResources(true);
@@ -452,35 +576,158 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
     }
 
     @Unique
-    private void vs$setAllShipsStatic(final boolean isStatic) {
-        if (shipWorld == null) {
+    private int vs$getStabilizationDelayTicks() {
+        final int startupShipStabilizationSeconds = VSConfigUpdater.getLiveStartupShipStabilizationSeconds();
+        return startupShipStabilizationSeconds * VS$TICKS_PER_SECOND;
+    }
+
+    @Unique
+    private int vs$getCountdownTicksFromDelay(final int delayTicks) {
+        return delayTicks == 0 ? 1 : delayTicks + 1;
+    }
+
+    @Unique
+    private void vs$reapplyStabilizationDelayToPendingTimers(final int currentDelayTicks) {
+        if (currentDelayTicks == vs$lastObservedStabilizationDelayTicks) {
             return;
         }
+        vs$lastObservedStabilizationDelayTicks = currentDelayTicks;
 
-        for (final ServerShip ship : shipWorld.getAllShips()) {
-            ship.setStatic(isStatic);
+        final int recalculatedCountdownTicks = vs$getCountdownTicksFromDelay(currentDelayTicks);
+        if (vs$pendingUnstaticTicks > 0) {
+            vs$pendingUnstaticTicks = recalculatedCountdownTicks;
+        }
+        if (!vs$pendingLoadUnfreezeTicks.isEmpty()) {
+            vs$pendingLoadUnfreezeTicks.replaceAll((shipId, remainingTicks) -> recalculatedCountdownTicks);
         }
     }
 
     @Unique
-    private void vs$unfreezeAllShipsWithZeroMotion() {
+    private Map<Long, LoadedServerShip> vs$getLoadedShipsSnapshot() {
+        final Map<Long, LoadedServerShip> loadedShips = new HashMap<>();
+        if (shipWorld == null) {
+            return loadedShips;
+        }
+
+        for (final LoadedServerShip loadedShip : shipWorld.getLoadedShips()) {
+            loadedShips.put(loadedShip.getId(), loadedShip);
+        }
+        return loadedShips;
+    }
+
+    @Unique
+    private void vs$handleRuntimeUnloadShip(final long shipId) {
         if (shipWorld == null) {
             return;
         }
 
-        for (final ServerShip ship : shipWorld.getAllShips()) {
-            final ShipTeleportData shipTeleportData = ValkyrienSkiesMod.getVsCore().newShipTeleportData(
-                ship.getTransform().getPositionInWorld(),
-                ship.getTransform().getShipToWorldRotation(),
-                new Vector3d(),
-                new Vector3d(),
-                ship.getChunkClaimDimension(),
-                null,
-                ship.getTransform().getPositionInShip()
-            );
-            shipWorld.teleportShip(ship, shipTeleportData);
-            ship.setStatic(false);
+        vs$pendingRuntimeLoadCandidates.remove(shipId);
+        vs$pendingLoadUnfreezeTicks.remove(shipId);
+
+        final ServerShip ship = shipWorld.getAllShips().getById(shipId);
+        if (ship != null && !ship.isStatic()) {
+            ship.setStatic(true);
+            if (vs$shipSavedData != null) {
+                vs$shipSavedData.markPendingDynamicRestore(shipId, true);
+            }
+            vs$sendRuntimeStabilizationMessage(shipId, true);
         }
+    }
+
+    @Unique
+    private void vs$scheduleOrExecuteRuntimeUnfreeze(final ServerShip ship, final int stabilizationDelayTicks) {
+        if (ship == null) {
+            return;
+        }
+
+        if (stabilizationDelayTicks == 0) {
+            vs$unfreezeShipWithZeroMotion(ship, true);
+        } else {
+            vs$pendingLoadUnfreezeTicks.put(ship.getId(), vs$getCountdownTicksFromDelay(stabilizationDelayTicks));
+        }
+    }
+
+    @Unique
+    private void vs$freezeShipForStabilization(final ServerShip ship) {
+        if (ship == null || vs$shipSavedData == null) {
+            return;
+        }
+
+        if (!ship.isStatic()) {
+            ship.setStatic(true);
+            vs$shipSavedData.markPendingDynamicRestore(ship.getId(), true);
+        }
+    }
+
+    @Unique
+    private void vs$unfreezeAllPendingShipsWithZeroMotion() {
+        if (shipWorld == null || vs$shipSavedData == null) {
+            return;
+        }
+
+        for (final LoadedServerShip loadedShip : shipWorld.getLoadedShips()) {
+            final long shipId = loadedShip.getId();
+            if (!vs$shipSavedData.isPendingDynamicRestore(shipId)) {
+                continue;
+            }
+            vs$unfreezeShipWithZeroMotion(loadedShip);
+            vs$sendStartupStabilizationMessage(shipId);
+        }
+    }
+
+    @Unique
+    private void vs$unfreezeShipWithZeroMotion(final ServerShip ship) {
+        vs$unfreezeShipWithZeroMotion(ship, false);
+    }
+
+    @Unique
+    private void vs$unfreezeShipWithZeroMotion(final ServerShip ship, final boolean sendRuntimeMessage) {
+        if (ship == null || shipWorld == null) {
+            return;
+        }
+
+        final ShipTeleportData shipTeleportData = ValkyrienSkiesMod.getVsCore().newShipTeleportData(
+            ship.getTransform().getPositionInWorld(),
+            ship.getTransform().getShipToWorldRotation(),
+            new Vector3d(),
+            new Vector3d(),
+            ship.getChunkClaimDimension(),
+            null,
+            ship.getTransform().getPositionInShip()
+        );
+        ship.setStatic(false);
+        shipWorld.teleportShip(ship, shipTeleportData);
+        if (sendRuntimeMessage) {
+            vs$sendRuntimeStabilizationMessage(ship.getId(), false);
+        }
+        if (vs$shipSavedData != null) {
+            vs$shipSavedData.markPendingDynamicRestore(ship.getId(), false);
+        }
+    }
+
+    @Unique
+    private void vs$sendRuntimeStabilizationMessage(final long shipId, final boolean isStatic) {
+        if (playerList == null || !VSConfigUpdater.getLiveStabilizationDebugMessages()) {
+            return;
+        }
+
+        final String targetState = isStatic ? "static" : "non-static";
+        final Component message = Component.literal(
+            "[VS] Runtime stabilization set ship " + shipId + " to " + targetState + "."
+        );
+        playerList.getPlayers().forEach(player -> player.sendSystemMessage(message));
+    }
+
+    @Unique
+    private void vs$sendStartupStabilizationMessage(final long shipId) {
+        if (playerList == null || !VSConfigUpdater.getLiveStabilizationDebugMessages()) {
+            return;
+        }
+
+        final Component message = Component.literal(
+            "[VS] Startup stabilization set ship " + shipId + " to non-static."
+        );
+        playerList.getPlayers().forEach(player -> player.sendSystemMessage(message));
     }
 
     // Only clear these after stopping the server so we can use them when saving
@@ -490,8 +737,17 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
     )
     private void postStopServer(final CallbackInfo ci) {
         dimensionToLevelMap.clear();
-        shipWorld.setGameServer(null);
+        loadedLevels = new HashSet<>();
+        vs$pendingLoadUnfreezeTicks.clear();
+        vs$pendingRuntimeLoadCandidates.clear();
+        vs$pendingUnstaticTicks = -1;
+        vs$lastObservedStabilizationDelayTicks = -1;
+        vs$shipSavedData = null;
+        if (shipWorld != null) {
+            shipWorld.setGameServer(null);
+        }
         shipWorld = null;
+        vsPipeline = null;
     }
 
     @NotNull

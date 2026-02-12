@@ -16,13 +16,21 @@ import org.valkyrienskies.mod.mixin.accessors.server.level.ChunkMapAccessor
 import org.valkyrienskies.mod.util.logger
 
 object ChunkManagement {
+    data class RuntimeStabilizationTransitions(
+        val runtimeUnloadShipIds: Set<Long>,
+        val runtimeWatchShipIds: Set<Long>
+    )
+
     @JvmStatic
-    fun tickChunkLoading(shipWorld: VsiServerShipWorld, server: MinecraftServer) {
+    fun tickChunkLoading(shipWorld: VsiServerShipWorld, server: MinecraftServer): RuntimeStabilizationTransitions {
         val (chunkWatchTasks, chunkUnwatchTasks) = shipWorld.getChunkWatchTasks()
+        val runtimeUnloadShipIds = mutableSetOf<Long>()
+        val runtimeWatchShipIds = mutableSetOf<Long>()
 
         // for now, just do all the watch tasks
 
         chunkWatchTasks.forEach { chunkWatchTask: VsiChunkWatchTask ->
+            runtimeWatchShipIds.add(chunkWatchTask.ship.id)
             logger.debug(
                 "Watch task for dimension " + chunkWatchTask.dimensionId + ": " +
                     chunkWatchTask.chunkX + " : " + chunkWatchTask.chunkZ
@@ -56,6 +64,7 @@ object ChunkManagement {
             val chunkPos = ChunkPos(chunkUnwatchTask.chunkX, chunkUnwatchTask.chunkZ)
 
             if (chunkUnwatchTask.shouldUnload) {
+                runtimeUnloadShipIds.add(chunkUnwatchTask.ship.id)
                 val level = server.getLevelFromDimensionId(chunkUnwatchTask.dimensionId)!!
                 level.chunkSource.updateChunkForced(chunkPos, false)
             }
@@ -66,6 +75,11 @@ object ChunkManagement {
         }
 
         shipWorld.setExecutedChunkWatchTasks(chunkWatchTasks, chunkUnwatchTasks)
+
+        return RuntimeStabilizationTransitions(
+            runtimeUnloadShipIds = runtimeUnloadShipIds,
+            runtimeWatchShipIds = runtimeWatchShipIds
+        )
     }
 
     private val logger by logger()
