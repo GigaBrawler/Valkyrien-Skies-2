@@ -33,6 +33,16 @@ object VSConfigUpdater {
         forgeConfigValuesMap[name] = value
     }
 
+    private fun matchesConfigFile(config: ModConfig, expectedFileName: String): Boolean {
+        val normalizedActual = config.fileName.replace('\\', '/')
+        val normalizedExpected = expectedFileName.replace('\\', '/')
+        val expectedTail = normalizedExpected.substringAfterLast('/')
+        return normalizedActual == normalizedExpected ||
+            normalizedActual.endsWith("/$normalizedExpected") ||
+            normalizedActual.endsWith("/$expectedTail") ||
+            normalizedActual == expectedTail
+    }
+
     private fun getLiveValueFromMap(key: String): Any? {
         return runCatching {
             forgeConfigValuesMap[key]?.get()
@@ -93,7 +103,7 @@ object VSConfigUpdater {
      **/
     @ApiStatus.Internal
     fun update(config: ModConfig) {
-        if (config.type == ModConfig.Type.SERVER && config.fileName == CANONICAL_SERVER_FILE_NAME) {
+        if (config.type == ModConfig.Type.SERVER && matchesConfigFile(config, CANONICAL_SERVER_FILE_NAME)) {
             canonicalServerConfig = config
         }
 
@@ -113,6 +123,8 @@ object VSConfigUpdater {
 
     @JvmStatic
     fun getLiveStartupShipStabilizationSeconds(): Int {
+        pendingCanonicalStabilizationSeconds?.let { return it.coerceAtLeast(0) }
+
         val serverValue = when (val rawValue = getLiveValueFromMap(STARTUP_SHIP_STABILIZATION_SECONDS_KEY)) {
             is Number -> rawValue.toInt()
             is String -> rawValue.toIntOrNull()
@@ -134,6 +146,8 @@ object VSConfigUpdater {
 
     @JvmStatic
     fun getLiveStabilizationDebugMessages(): Boolean {
+        pendingCanonicalDebugMessages?.let { return it }
+
         val serverValue = when (val rawValue = getLiveValueFromMap(STABILIZATION_DEBUG_MESSAGES_KEY)) {
             is Boolean -> rawValue
             is String -> rawValue.toBooleanStrictOrNull()
@@ -154,7 +168,7 @@ object VSConfigUpdater {
     }
 
     private fun syncCoreServerStabilizationAlias(config: ModConfig, updatedEntries: MutableSet<ConfigUpdateEntry>) {
-        if (config.type != ModConfig.Type.SERVER || config.fileName != CORE_SERVER_FILE_NAME) {
+        if (config.type != ModConfig.Type.SERVER || !matchesConfigFile(config, CORE_SERVER_FILE_NAME)) {
             return
         }
 
@@ -208,7 +222,7 @@ object VSConfigUpdater {
 
     private fun applyPendingCanonicalStabilizationMirror(updatedEntries: MutableSet<ConfigUpdateEntry>) {
         val serverConfig = canonicalServerConfig ?: return
-        if (serverConfig.type != ModConfig.Type.SERVER || serverConfig.fileName != CANONICAL_SERVER_FILE_NAME) {
+        if (serverConfig.type != ModConfig.Type.SERVER || !matchesConfigFile(serverConfig, CANONICAL_SERVER_FILE_NAME)) {
             return
         }
 

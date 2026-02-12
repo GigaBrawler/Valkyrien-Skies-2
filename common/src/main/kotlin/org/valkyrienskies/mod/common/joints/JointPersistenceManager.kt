@@ -4,6 +4,7 @@ import net.minecraft.core.BlockPos
 import org.valkyrienskies.core.api.world.PhysLevel
 import org.valkyrienskies.core.impl.util.serialization.VSJacksonUtil
 import org.valkyrienskies.core.internal.joints.VSJoint
+import org.valkyrienskies.core.internal.joints.VSJointPose
 import org.valkyrienskies.core.internal.world.VsiPhysLevel
 import org.valkyrienskies.mod.common.ShipSavedData
 import org.valkyrienskies.mod.common.ShipSavedData.PersistentJointRecord
@@ -11,10 +12,14 @@ import org.valkyrienskies.mod.common.ShipSavedData.PersistentJointState
 import org.valkyrienskies.mod.common.util.GameToPhysicsAdapter
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 
 object JointPersistenceManager {
     private const val RESTORE_RETRY_INTERVAL_TICKS = 20
     private const val MISSING_BODY_GRACE_ATTEMPTS = 120
+    private const val QUATERNION_NORM_TOLERANCE = 1e-3
+    private val CLOCKWORK_PAIR_OWNER_REF_REGEX =
+        Regex("^pair:[^|]+\\|-?\\d+,-?\\d+,-?\\d+\\|-?\\d+,-?\\d+,-?\\d+\\|[A-Za-z0-9_:-]+$")
 
     private val pendingRestoreByDimension: MutableMap<String, MutableSet<String>> = ConcurrentHashMap()
     private val inFlightRestoreByDimension: MutableMap<String, MutableSet<String>> = ConcurrentHashMap()
@@ -31,6 +36,9 @@ object JointPersistenceManager {
         inFlightRestoreByDimension.clear()
         restoreCooldownByKey.clear()
         missingBodyAttemptsByKey.clear()
+
+        pruneLegacyClockworkOwnerRefs(savedData)
+
         savedData.getAllPersistentJoints()
             .asSequence()
             .filter { it.state == PersistentJointState.ACTIVE && it.dimensionId != null }
@@ -299,6 +307,11 @@ object JointPersistenceManager {
                 pendingSet.remove(persistentKey)
                 return@forEach
             }
+            if (!isJointNumericallyValid(joint)) {
+                savedData.markPersistentJointTombstone(persistentKey)
+                pendingSet.remove(persistentKey)
+                return@forEach
+            }
 
             if (!areJointBodiesReady(physLevel, joint)) {
                 val missingAttempts = (missingBodyAttemptsByKey[persistentKey] ?: 0) + 1
@@ -346,5 +359,50 @@ object JointPersistenceManager {
             val clazz = Class.forName(record.jointType).asSubclass(VSJoint::class.java)
             VSJacksonUtil.dtoMapper.readValue(record.jointPayload, clazz)
         }.getOrNull()
+    }
+
+    private fun isJointNumericallyValid(joint: VSJoint): Boolean {
+        return isPoseNumericallyValid(joint.pose0) && isPoseNumericallyValid(joint.pose1)
+    }
+
+    private fun isPoseNumericallyValid(pose: VSJointPose): Boolean {
+        val pos = pose.pos
+        val rot = pose.rot
+        if (!pos.x().isFinite() || !pos.y().isFinite() || !pos.z().isFinite()) {
+            return false
+        }
+        if (!rot.x().isFinite() || !rot.y().isFinite() || !rot.z().isFinite() || !rot.w().isFinite()) {
+            return false
+        }
+        val norm = rot.x() * rot.x() + rot.y() * rot.y() + rot.z() * rot.z() + rot.w() * rot.w()
+        if (!norm.isFinite() || norm <= 1e-12) {
+            return false
+        }
+        return abs(norm - 1.0) <= QUATERNION_NORM_TOLERANCE
+    }
+
+    private fun pruneLegacyClockworkOwnerRefs(savedData: ShipSavedData) {
+        savedData.getAllPersistentJoints().forEach { record ->
+            if (record.state != PersistentJointState.ACTIVE) {
+                return@forEach
+            }
+            val shouldPrune = when (record.ownerType) {
+                "clockwork_slicker" -> {
+                    val ownerRef = record.ownerRef
+                    ownerRef.isNullOrBlank() || !ownerRef.startsWith("key:") || ownerRef.length <= 4
+                }
+                "clockwork_extendon",
+                "clockwork_hose_port",
+                "clockwork_spinoff_bearing" -> {
+                    val ownerRef = record.ownerRef
+                    ownerRef.isNullOrBlank() || !CLOCKWORK_PAIR_OWNER_REF_REGEX.matches(ownerRef)
+                }
+                else -> false
+            }
+            if (shouldPrune) {
+                savedData.markPersistentJointTombstone(record.persistentKey)
+            }
+        }
+        savedData.compactPersistentJointTombstones()
     }
 }

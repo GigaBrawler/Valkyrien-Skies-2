@@ -166,7 +166,7 @@ object VSGameConfig {
             @ConfigEntry(
                 description = "Seconds to keep ships static before unfreezing them after startup and runtime proximity reloads."
             )
-            var startupShipStabilizationSeconds = 30
+            var startupShipStabilizationSeconds = 3
 
             @ConfigEntry(
                 description = "If true, send debug chat messages when startup/runtime stabilization changes a ship static state."
