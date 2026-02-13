@@ -185,6 +185,12 @@ object ValkyrienSkiesMod {
         return adapter
     }
 
+    @JvmStatic
+    fun resetGameToPhysicsAdapters() {
+        dimensionalGTPAs.values.forEach { it.clearRuntimeState() }
+        dimensionalGTPAs.clear()
+    }
+
     fun addBlockEntityPhysTicker(
         dimensionId: DimensionId, pos: BlockPos, blockEntity: BlockEntityPhysicsListener
     ) {

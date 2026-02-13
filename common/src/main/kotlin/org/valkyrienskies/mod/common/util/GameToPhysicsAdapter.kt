@@ -36,6 +36,7 @@ class GameToPhysicsAdapter {
     private val runtimeIdAliases = ConcurrentHashMap<Int, Int>()
     private val persistentKeyToRuntimeId = ConcurrentHashMap<String, Int>()
     private val runtimeIdToPersistentKey = ConcurrentHashMap<Int, String>()
+    private val deferredRestoreCallbacks = ConcurrentHashMap<String, ConcurrentLinkedQueue<Consumer<VSJointId>>>()
 
     private val toBeStatic = ConcurrentLinkedQueue<Pair<ShipId, Boolean>>()
 
@@ -282,6 +283,34 @@ class GameToPhysicsAdapter {
         persistenceDimensionId = dimensionId
     }
 
+    fun clearRuntimeState() {
+        worldForces.clear()
+        worldTorques.clear()
+        modelForces.clear()
+        modelTorques.clear()
+        bodyForces.clear()
+        bodyTorques.clear()
+        worldToModelForces.clear()
+        worldToBodyForces.clear()
+
+        addedJoints.clear()
+        updatedJoints.clear()
+        deletedJoints.clear()
+
+        shipToJointIds.clear()
+        jointById.clear()
+        runtimeIdAliases.clear()
+        persistentKeyToRuntimeId.clear()
+        runtimeIdToPersistentKey.clear()
+        deferredRestoreCallbacks.clear()
+
+        toBeStatic.clear()
+        enablePairs.clear()
+        disablePairs.clear()
+
+        persistenceDimensionId = null
+    }
+
     fun registerRuntimeAlias(legacyRuntimeId: Int, runtimeId: Int) {
         if (legacyRuntimeId < 0 || runtimeId < 0 || legacyRuntimeId == runtimeId) {
             return
@@ -340,6 +369,28 @@ class GameToPhysicsAdapter {
         return getRuntimeIdForPersistentKey(persistentKey) != null
     }
 
+    fun queueDeferredRestoreCallback(persistentKey: String, callback: Consumer<VSJointId>) {
+        if (persistentKey.isBlank()) {
+            callback.accept(-1)
+            return
+        }
+        deferredRestoreCallbacks.computeIfAbsent(persistentKey) { ConcurrentLinkedQueue() }.add(callback)
+    }
+
+    fun notifyPersistentRestoreResolved(persistentKey: String, runtimeId: Int) {
+        if (persistentKey.isBlank() || runtimeId < 0) {
+            return
+        }
+        dispatchDeferredRestoreCallbacks(persistentKey, resolveRuntimeJointId(runtimeId))
+    }
+
+    fun notifyPersistentRestoreTerminalFailure(persistentKey: String) {
+        if (persistentKey.isBlank()) {
+            return
+        }
+        dispatchDeferredRestoreCallbacks(persistentKey, -1)
+    }
+
     fun getRuntimeIdAliasesSnapshot(): Map<Int, Int> = runtimeIdAliases.toMap()
 
     fun getPersistentKeyBindingsSnapshot(): Map<String, Int> = persistentKeyToRuntimeId.toMap()
@@ -366,6 +417,7 @@ class GameToPhysicsAdapter {
             ownerType,
             ownerRef
         )
+        val hadActiveDescriptor = JointPersistenceManager.isActiveDescriptor(dimensionId, resolvedPersistentKey)
 
         val existingRuntimeId = JointPersistenceManager.findRestoredRuntimeIdForOwner(
             dimensionId,
@@ -374,17 +426,18 @@ class GameToPhysicsAdapter {
             this,
             null
         ) ?: getRuntimeIdForPersistentKey(resolvedPersistentKey)
-        if (existingRuntimeId != null && jointById.containsKey(resolveRuntimeJointId(existingRuntimeId))) {
+        val resolvedExistingRuntimeId = existingRuntimeId?.let(::resolveRuntimeJointId)
+        if (resolvedExistingRuntimeId != null && jointById.containsKey(resolvedExistingRuntimeId)) {
             JointPersistenceManager.upsertActiveJointDescriptor(
                 dimensionId = dimensionId,
                 persistentKey = resolvedPersistentKey,
                 joint = joint,
                 ownerType = ownerType,
                 ownerRef = ownerRef,
-                runtimeId = existingRuntimeId
+                runtimeId = resolvedExistingRuntimeId
             )
-            bindPersistentKey(resolvedPersistentKey, existingRuntimeId)
-            function.accept(existingRuntimeId)
+            bindPersistentKey(resolvedPersistentKey, resolvedExistingRuntimeId)
+            function.accept(resolvedExistingRuntimeId)
             return
         }
 
@@ -394,8 +447,12 @@ class GameToPhysicsAdapter {
             joint = joint,
             ownerType = ownerType,
             ownerRef = ownerRef,
-            runtimeId = getRuntimeIdForPersistentKey(resolvedPersistentKey)
+            runtimeId = resolvedExistingRuntimeId
         )
+        if (hadActiveDescriptor) {
+            queueDeferredRestoreCallback(resolvedPersistentKey, function)
+            return
+        }
 
         val wrappedCallback = Consumer<VSJointId> { runtimeId ->
             JointPersistenceManager.onAddResult(dimensionId, resolvedPersistentKey, runtimeId, this)
@@ -405,14 +462,11 @@ class GameToPhysicsAdapter {
     }
 
     fun restorePersistentJoint(descriptor: ShipSavedData.PersistentJointRecord, joint: VSJoint) {
-        addJointPersistent(
-            joint = joint,
-            ownerType = descriptor.ownerType,
-            ownerRef = descriptor.ownerRef,
-            persistentKey = descriptor.persistentKey,
-            delay = 0,
-            function = Consumer { _ -> }
-        )
+        val dimensionId = persistenceDimensionId ?: return
+        val wrappedCallback = Consumer<VSJointId> { runtimeId ->
+            JointPersistenceManager.onAddResult(dimensionId, descriptor.persistentKey, runtimeId, this)
+        }
+        addedJoints[joint to wrappedCallback] = 0
     }
 
     fun addJoint(joint: VSJoint, delay: Int = 0, function: Consumer<VSJointId>) {
@@ -493,6 +547,14 @@ class GameToPhysicsAdapter {
 
     fun disableCollisionBetween(shipA: ShipId, shipB: ShipId) {
         disablePairs.add(shipA to shipB)
+    }
+
+    private fun dispatchDeferredRestoreCallbacks(persistentKey: String, runtimeId: Int) {
+        val callbacks = deferredRestoreCallbacks.remove(persistentKey) ?: return
+        while (true) {
+            val callback = callbacks.poll() ?: break
+            callback.accept(runtimeId)
+        }
     }
 
     private data class ForceAtPos(val force: Vector3dc, val pos: Vector3dc?)

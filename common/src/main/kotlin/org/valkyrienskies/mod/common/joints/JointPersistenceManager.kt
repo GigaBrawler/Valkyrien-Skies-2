@@ -81,6 +81,12 @@ object JointPersistenceManager {
         return existing?.persistentKey ?: requestedKey
     }
 
+    fun isActiveDescriptor(dimensionId: String, persistentKey: String): Boolean {
+        val savedData = shipSavedData ?: return false
+        val descriptor = savedData.getPersistentJoint(persistentKey) ?: return false
+        return descriptor.state == PersistentJointState.ACTIVE && descriptor.dimensionId == dimensionId
+    }
+
     fun findRestoredRuntimeIdForOwner(
         dimensionId: String,
         ownerType: String?,
@@ -144,18 +150,19 @@ object JointPersistenceManager {
             return
         }
 
-        val savedData = shipSavedData ?: return
-        val existing = savedData.getPersistentJoint(persistentKey) ?: return
-        val previousRuntimeId = existing.lastKnownRuntimeId
+        val savedData = shipSavedData
+        val existing = savedData?.getPersistentJoint(persistentKey)
+        val previousRuntimeId = existing?.lastKnownRuntimeId
         if (previousRuntimeId != null && previousRuntimeId != runtimeId) {
             adapter.registerRuntimeAlias(previousRuntimeId, runtimeId)
         }
+        existing?.let { savedData?.upsertPersistentJoint(it.copy(lastKnownRuntimeId = runtimeId)) }
         adapter.bindPersistentKey(persistentKey, runtimeId)
 
-        savedData.upsertPersistentJoint(existing.copy(lastKnownRuntimeId = runtimeId))
         pendingRestoreByDimension.getOrPut(dimensionId) { ConcurrentHashMap.newKeySet() }.remove(persistentKey)
         restoreCooldownByKey.remove(persistentKey)
         missingBodyAttemptsByKey.remove(persistentKey)
+        adapter.notifyPersistentRestoreResolved(persistentKey, runtimeId)
     }
 
     fun onRuntimeJointUpdated(
@@ -250,6 +257,7 @@ object JointPersistenceManager {
                 } else if (existing.persistentKey != descriptor.persistentKey) {
                     savedData.markPersistentJointTombstone(descriptor.persistentKey)
                     pendingSet.remove(descriptor.persistentKey)
+                    adapter.notifyPersistentRestoreTerminalFailure(descriptor.persistentKey)
                 }
             }
         }
@@ -257,10 +265,12 @@ object JointPersistenceManager {
         pendingSet.toList().forEach { persistentKey ->
             val descriptor = savedData.getPersistentJoint(persistentKey) ?: run {
                 pendingSet.remove(persistentKey)
+                adapter.notifyPersistentRestoreTerminalFailure(persistentKey)
                 return@forEach
             }
             if (descriptor.state != PersistentJointState.ACTIVE) {
                 pendingSet.remove(persistentKey)
+                adapter.notifyPersistentRestoreTerminalFailure(persistentKey)
                 return@forEach
             }
             if (inflightSet.contains(persistentKey)) {
@@ -270,6 +280,7 @@ object JointPersistenceManager {
             val currentRuntimeId = adapter.getRuntimeIdForPersistentKey(persistentKey)
             if (currentRuntimeId != null && getJointById(physLevel, currentRuntimeId) != null) {
                 pendingSet.remove(persistentKey)
+                adapter.notifyPersistentRestoreResolved(persistentKey, currentRuntimeId)
                 return@forEach
             }
 
@@ -284,6 +295,7 @@ object JointPersistenceManager {
                     adapter.bindPersistentKey(persistentKey, existingRuntime)
                     savedData.upsertPersistentJoint(descriptor.copy(lastKnownRuntimeId = existingRuntime))
                     pendingSet.remove(persistentKey)
+                    adapter.notifyPersistentRestoreResolved(persistentKey, existingRuntime)
                     return@forEach
                 }
             }
@@ -292,6 +304,7 @@ object JointPersistenceManager {
                 if (getJointById(physLevel, lastRuntimeId) != null) {
                     adapter.bindPersistentKey(persistentKey, lastRuntimeId)
                     pendingSet.remove(persistentKey)
+                    adapter.notifyPersistentRestoreResolved(persistentKey, lastRuntimeId)
                     return@forEach
                 }
             }
@@ -305,11 +318,13 @@ object JointPersistenceManager {
             val joint = deserializeJoint(descriptor) ?: run {
                 savedData.markPersistentJointTombstone(persistentKey)
                 pendingSet.remove(persistentKey)
+                adapter.notifyPersistentRestoreTerminalFailure(persistentKey)
                 return@forEach
             }
             if (!isJointNumericallyValid(joint)) {
                 savedData.markPersistentJointTombstone(persistentKey)
                 pendingSet.remove(persistentKey)
+                adapter.notifyPersistentRestoreTerminalFailure(persistentKey)
                 return@forEach
             }
 
@@ -320,6 +335,7 @@ object JointPersistenceManager {
                 if (missingAttempts > MISSING_BODY_GRACE_ATTEMPTS) {
                     savedData.markPersistentJointTombstone(persistentKey)
                     pendingSet.remove(persistentKey)
+                    adapter.notifyPersistentRestoreTerminalFailure(persistentKey)
                 }
                 return@forEach
             }

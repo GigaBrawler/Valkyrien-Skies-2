@@ -163,6 +163,8 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
             ValkyrienSkiesMod.getVsCore().registerBlockStates(MassDatapackResolver.INSTANCE.getBlockStateData());
         }
 
+        ValkyrienSkiesMod.resetGameToPhysicsAdapters();
+
         // Load ship data from the world storage
         final ShipSavedData shipSavedData = overworld().getDataStorage()
             .computeIfAbsent(ShipSavedData::load, ShipSavedData.Companion::createEmpty, ShipSavedData.SAVED_DATA_ID);
@@ -576,6 +578,7 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
             vsPipeline.setDeleteResources(true);
             vsPipeline.setArePhysicsRunning(true);
         }
+        ValkyrienSkiesMod.resetGameToPhysicsAdapters();
     }
 
     @Unique
@@ -750,6 +753,7 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
             shipWorld.setGameServer(null);
         }
         JointPersistenceManager.clear();
+        ValkyrienSkiesMod.resetGameToPhysicsAdapters();
         shipWorld = null;
         vsPipeline = null;
     }
