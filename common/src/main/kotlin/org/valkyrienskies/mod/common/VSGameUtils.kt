@@ -205,6 +205,20 @@ private fun getShipObjectManagingPosImpl(world: Level?, chunkX: Int, chunkZ: Int
  */
 fun Level.transformFromWorldToNearbyShipsAndWorld(aabb: AABB, cb: Consumer<AABB>) {
     val tmpAABB = AABBd()
+    cb.accept(aabb)
+    getShipsIntersecting(aabb).forEach { ship ->
+        cb.accept(tmpAABB.set(aabb).transform(ship.worldToShip).toMinecraft())
+    }
+}
+
+/**
+ * Same as [transformFromWorldToNearbyShipsAndWorld] but does not call [cb] with the original [aabb].
+ *
+ * Not sure if this is actually useful, but our MixinEntity for water-flowing on ships seems to need it.
+ */
+fun Level.transformFromWorldToNearbyShips(aabb: AABB, cb: Consumer<AABB>) {
+    val tmpAABB = AABBd()
+    //cb.accept(aabb)
     getShipsIntersecting(aabb).forEach { ship ->
         cb.accept(tmpAABB.set(aabb).transform(ship.worldToShip).toMinecraft())
     }

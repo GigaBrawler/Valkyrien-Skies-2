@@ -80,6 +80,11 @@ dependencies {
     // Twilight Forest
     modImplementation("teamtwilight:twilightforest:${twilightforest_version}:universal")
 
+    // CBC
+    //modRuntimeOnly("com.rbasamoyai:createbigcannons:${createbigcannons_version}+mc.${minecraft_version}-forge-build.250") { transitive = false }
+    //modRuntimeOnly("com.rbasamoyai:ritchiesprojectilelib:${rpl_version}+mc.${minecraft_version}-forge")
+
+
     // Create compat
     modImplementation("com.simibubi.create:create-${minecraft_version}:${create_version}:slim") { transitive = false }
     modImplementation("net.createmod.ponder:Ponder-Forge-${minecraft_version}:${ponder_version}")

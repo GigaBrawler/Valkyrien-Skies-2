@@ -10,6 +10,7 @@ import net.minecraft.world.level.LevelReader
 import net.minecraft.world.level.ServerLevelAccessor
 import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.block.Block
+import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructurePlaceSettings
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureProcessor
@@ -226,8 +227,16 @@ object ShipAssembler {
         if (removeOriginal) {
             for (pos in blocks) {
                 level.getBlockEntity(pos)?.let {
-                    Clearable.tryClear(it)
+                    if (it is Clearable) {
+                        Clearable.tryClear(it)
+                    } else {
+                        // Clear all NBT if it doesn't implement IClearable
+                        it.load(CompoundTag())
+                    }
+                    // Without this, copycats still drop their items
+                    level.removeBlockEntity(pos)
                 }
+
                 level.setBlock(pos, Blocks.BARRIER.defaultBlockState(), Block.UPDATE_CLIENTS)
             }
             for (pos in blocks) {
