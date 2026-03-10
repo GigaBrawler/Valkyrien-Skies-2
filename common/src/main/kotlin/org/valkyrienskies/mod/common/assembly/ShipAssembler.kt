@@ -24,9 +24,12 @@ import org.valkyrienskies.core.api.ships.LoadedServerShip
 import org.valkyrienskies.core.api.ships.ServerShip
 import org.valkyrienskies.core.api.ships.properties.ShipId
 import org.valkyrienskies.core.api.util.GameTickOnly
+import org.valkyrienskies.core.impl.config.VSCoreConfig
 import org.valkyrienskies.core.internal.ships.VsiServerShip
+import org.valkyrienskies.mod.common.config.VSGameConfig
 import org.valkyrienskies.mod.common.dimensionId
 import org.valkyrienskies.mod.common.executeIf
+import org.valkyrienskies.mod.common.forEach
 import org.valkyrienskies.mod.common.getLoadedShipManagingPos
 import org.valkyrienskies.mod.common.getShipManagingPos
 import org.valkyrienskies.mod.common.inAssemblyBlacklist
@@ -307,23 +310,26 @@ object ShipAssembler {
             }
             VSAssemblyEvents.onPasteAfterBlocksAreLoaded.emit(VSAssemblyEvents.OnPasteAfterBlocksAreLoaded(level, fromShip, toShip, Pair(fromCenter, centerOfShip), eventData))
             //force update connectivity because this new assemblyslop doesn't update it :(
-            for (pos in chunkPoses) {
-                val worldChunk = level.getChunk(pos.x, pos.z) ?: continue
-                val chunkSections = worldChunk.sections ?: continue
-                for (sectionY in 0 until worldChunk.sectionsCount) {
-                    val sectionPos = Vector3i(pos.x, worldChunk.getSectionYFromSectionIndex(sectionY), pos.z)
-                    val section = chunkSections[sectionY] ?: continue
-                    if (section.hasOnlyAir()) continue
-                    val update = section.toDenseVoxelUpdate(sectionPos)
-                    level.shipObjectWorld.forceUpdateConnectivityChunk(
-                        level.dimensionId,
-                        sectionPos.x,
-                        sectionPos.y,
-                        sectionPos.z,
-                        update
-                    )
+            if (VSCoreConfig.SERVER.sp.enableConnectivity) {
+                for (pos in chunkPoses) {
+                    val worldChunk = level.getChunk(pos.x, pos.z) ?: continue
+                    val chunkSections = worldChunk.sections ?: continue
+                    for (sectionY in 0 until worldChunk.sectionsCount) {
+                        val sectionPos = Vector3i(pos.x, worldChunk.getSectionYFromSectionIndex(sectionY), pos.z)
+                        val section = chunkSections[sectionY] ?: continue
+                        if (section.hasOnlyAir()) continue
+                        val update = section.toDenseVoxelUpdate(sectionPos)
+                        level.shipObjectWorld.forceUpdateConnectivityChunk(
+                            level.dimensionId,
+                            sectionPos.x,
+                            sectionPos.y,
+                            sectionPos.z,
+                            update
+                        )
+                    }
                 }
             }
+
             if (fromShip is LoadedServerShip) {
                 val splittingDisabler = fromShip.getAttachment(SplittingDisablerAttachment::class.java)
                 if (wasSplittingEnabled) {
@@ -346,6 +352,7 @@ object ShipAssembler {
         return assembleToShip(level as ServerLevel, blocks.toSet(), scale)
     }
 
+    @Suppress("unused")
     fun isValidShipBlock(state: BlockState?) : Boolean {
         if (state == null) return false
         if (state.isAir) return false
@@ -361,17 +368,12 @@ object ShipAssembler {
         }
         if (deleteBlocks) {
             val aabb = ship.shipAABB ?: return 0
-            // There has to be a better way to do this...
-            for (x in aabb.minX()..aabb.maxX()) {
-                for (y in aabb.minY()..aabb.maxY()) {
-                    for (z in aabb.minZ()..aabb.maxZ()) {
-                        // Not sure if 2 is what we want, but its what /fill uses
-                        if (dropBlocks)
-                            level.destroyBlock(BlockPos(x, y, z), true)
-                        else
-                            level.setBlock(BlockPos(x, y, z), Blocks.AIR.defaultBlockState(), 2)
-                    }
-                }
+            aabb.forEach { x, y, z ->
+                if (dropBlocks)
+                    level.destroyBlock(BlockPos(x, y, z), true)
+                else
+                    // Not sure if 2 is what we want, but it's what /fill uses
+                    level.setBlock(BlockPos(x, y, z), Blocks.AIR.defaultBlockState(), 2)
             }
         }
 

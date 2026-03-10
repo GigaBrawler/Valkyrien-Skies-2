@@ -343,10 +343,30 @@ object VSGameConfig {
                 description = "The permission level required to use the /vs backend command. Must be 0 <= x <= 4"
             )
             var changeBackendCommandPerms = 4
+
+            @ConfigEntry(
+                description = "The permission level required to use the /vs dry command. Must be 0 <= x <= 4"
+            )
+            var dryShipCommandPerms = 2
         }
     }
 
     class Common {
+
+        @ConfigEntry(
+            description = "Multiplier for ship pocket flooding speed. `1.0` = current baseline, `0.3333` = ~3x slower flooding."
+        )
+        var shipPocketFloodRateMultiplier = 0.3333333333333333
+
+        @ConfigEntry(
+            description = "Multiplier for ship pocket leak/flood particle velocity."
+        )
+        var shipPocketParticleSpeedMultiplier = 1.0
+
+        @ConfigEntry(
+            description = "Enables ship air pockets. Must be enabled on both client and server."
+        )
+        var enableAirPockets = true
 
         @JvmField
         @ConfigCategory(title = "Advanced")
