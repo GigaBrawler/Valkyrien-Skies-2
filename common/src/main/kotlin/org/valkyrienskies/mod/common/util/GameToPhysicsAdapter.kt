@@ -46,6 +46,7 @@ class GameToPhysicsAdapter {
     @Volatile
     private var persistenceDimensionId: String? = null
 
+    private val shipToLiquidOverlap = ConcurrentHashMap<Long, Double>()
 
     fun physTick(physLevel: PhysLevel, delta: Double) {
 
@@ -160,6 +161,10 @@ class GameToPhysicsAdapter {
         enablePairs.pollUntilEmpty { pair -> physLevel.enableCollisionBetween(pair.first, pair.second) }
         disablePairs.pollUntilEmpty { pair -> physLevel.disableCollisionBetween(pair.first, pair.second) }
 
+        shipToLiquidOverlap.clear()
+        physLevel.getAllPhysShips().forEach { ship ->
+            shipToLiquidOverlap[ship.id] = ship.liquidOverlap
+        }
     }
 
     /**
@@ -595,6 +600,14 @@ class GameToPhysicsAdapter {
         }
 
         return visited.toList()
+    }
+
+    /**
+     * Gets the percent of the ship that is overlapping a fluid, from 0 to 1.
+     * Should not be null unless the `id` is not a valid ship
+     */
+    fun getLiquidOverlap(id: Long): Double? {
+        return shipToLiquidOverlap[id]
     }
 
     private data class ForceAtPos(val force: Vector3dc, val pos: Vector3dc?)
