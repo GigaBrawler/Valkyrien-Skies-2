@@ -1,6 +1,7 @@
 package org.valkyrienskies.mod.common.assembly
 
 import net.minecraft.core.BlockPos
+import net.minecraft.core.SectionPos
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.Clearable
@@ -10,7 +11,9 @@ import net.minecraft.world.level.LevelReader
 import net.minecraft.world.level.ServerLevelAccessor
 import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.block.Block
+import net.minecraft.world.level.block.EntityBlock
 import net.minecraft.world.level.block.entity.BlockEntity
+import net.minecraft.world.level.block.entity.RandomizableContainerBlockEntity
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructurePlaceSettings
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureProcessor
@@ -96,6 +99,159 @@ object ShipAssembler {
         return chunkSet
     }
 
+    private data class AssemblyBlockSnapshot(
+        val sourcePos: BlockPos,
+        val destPos: BlockPos,
+        val state: BlockState,
+        val tag: CompoundTag?
+    )
+
+    private data class AssemblySnapshotResult(
+        val blocks: List<AssemblyBlockSnapshot>,
+        val changedBlockPositions: Set<BlockPos>,
+        val changedChunks: Set<ChunkPos>,
+        val changedSections: Set<Vector3i>
+    )
+
+    private fun phaseStart(): Long = System.nanoTime()
+
+    private fun logPhase(name: String, startNanos: Long) {
+        ASSEMBLY_LOGGER.debug("{} took {} ms", name, (System.nanoTime() - startNanos) / 1_000_000.0)
+    }
+
+    private fun copyBlockTag(
+        level: ServerLevel,
+        pos: BlockPos,
+        state: BlockState,
+        blockEntity: BlockEntity?,
+        shipsBeingCopied: List<ServerShip>,
+        centerPositions: Map<Long, Vector3d>
+    ): CompoundTag? {
+        val customTag = if (state.block is ICopyableBlock) {
+            (state.block as ICopyableBlock).onCopy(level, pos, state, blockEntity, shipsBeingCopied, centerPositions)
+        } else {
+            null
+        }
+        return customTag ?: blockEntity?.saveWithId()
+    }
+
+    private fun retargetBlockEntityTag(tag: CompoundTag?, pos: BlockPos): CompoundTag? {
+        return tag?.copy()?.also {
+            it.putInt("x", pos.x)
+            it.putInt("y", pos.y)
+            it.putInt("z", pos.z)
+        }
+    }
+
+    @Suppress("NULL_FOR_NONNULL_TYPE")
+    private fun clearSourceBlockEntity(level: ServerLevel, pos: BlockPos) {
+        level.getBlockEntity(pos)?.let {
+            if (it is Clearable) {
+                Clearable.tryClear(it)
+            } else {
+                it.load(CompoundTag())
+            }
+            if (it is RandomizableContainerBlockEntity) {
+                it.setLootTable(null, 0)
+            }
+            level.removeBlockEntity(pos)
+        }
+    }
+
+    private fun ensureBlockEntity(level: ServerLevel, pos: BlockPos, state: BlockState): BlockEntity? {
+        val existing = level.getBlockEntity(pos)
+        if (existing != null) {
+            return existing
+        }
+        val block = state.block
+        if (block is EntityBlock) {
+            val created = block.newBlockEntity(pos, state)
+            if (created != null) {
+                level.setBlockEntity(created)
+                return created
+            }
+        }
+        return null
+    }
+
+    private fun buildAssemblySnapshot(
+        level: ServerLevel,
+        blocks: Set<BlockPos>,
+        minStructurePos: BlockPos,
+        cornerOfShip: BlockPos,
+        shipsBeingCopied: List<ServerShip>,
+        centerPositions: Map<Long, Vector3d>
+    ): AssemblySnapshotResult {
+        val snapshots = ArrayList<AssemblyBlockSnapshot>(blocks.size)
+        val changedPositions = LinkedHashSet<BlockPos>(blocks.size * 2)
+        val changedChunks = LinkedHashSet<ChunkPos>()
+        val changedSections = LinkedHashSet<Vector3i>()
+
+        for (sourcePos in blocks) {
+            val relativePos = sourcePos.subtract(minStructurePos)
+            val destPos = cornerOfShip.offset(relativePos)
+            val state = level.getBlockState(sourcePos)
+            val tag = copyBlockTag(level, sourcePos, state, level.getBlockEntity(sourcePos), shipsBeingCopied, centerPositions)
+            snapshots += AssemblyBlockSnapshot(sourcePos, destPos, state, tag)
+
+            changedPositions += sourcePos
+            changedPositions += destPos
+            changedChunks += ChunkPos(sourcePos)
+            changedChunks += ChunkPos(destPos)
+
+            changedSections += Vector3i(
+                SectionPos.blockToSectionCoord(sourcePos.x),
+                SectionPos.blockToSectionCoord(sourcePos.y),
+                SectionPos.blockToSectionCoord(sourcePos.z)
+            )
+            changedSections += Vector3i(
+                SectionPos.blockToSectionCoord(destPos.x),
+                SectionPos.blockToSectionCoord(destPos.y),
+                SectionPos.blockToSectionCoord(destPos.z)
+            )
+        }
+
+        return AssemblySnapshotResult(snapshots, changedPositions, changedChunks, changedSections)
+    }
+
+    private fun applyAssemblySnapshot(
+        level: ServerLevel,
+        snapshot: AssemblySnapshotResult,
+        oldShipIdToNewShipId: Map<Long, Long>,
+        centerPositions: Map<Long, Pair<Vector3d, Vector3d>>,
+        removeOriginal: Boolean
+    ) {
+        if (removeOriginal) {
+            for (entry in snapshot.blocks) {
+                clearSourceBlockEntity(level, entry.sourcePos)
+                level.getChunk(entry.sourcePos).setBlockState(entry.sourcePos, AIR, false)
+            }
+        }
+
+        for (entry in snapshot.blocks) {
+            level.removeBlockEntity(entry.destPos)
+            level.getChunk(entry.destPos).setBlockState(entry.destPos, entry.state, false)
+
+            val block = entry.state.block
+            val finalTag = if (block is ICopyableBlock) {
+                block.onPaste(level, entry.destPos, entry.state, oldShipIdToNewShipId, centerPositions, entry.tag)
+            } else {
+                entry.tag
+            } ?: entry.tag
+
+            if (entry.state.hasBlockEntity() && finalTag != null) {
+                val blockEntity = ensureBlockEntity(level, entry.destPos, entry.state)
+                val retargetedTag = retargetBlockEntityTag(finalTag, entry.destPos)
+                if (blockEntity != null && retargetedTag != null) {
+                    blockEntity.load(retargetedTag)
+                    blockEntity.setChanged()
+                }
+            }
+        }
+
+        snapshot.changedBlockPositions.forEach(level.chunkSource::blockChanged)
+    }
+
     data class AssembleContext(val ship: ServerShip, val fromCenter: Vector3d, val toCenter: Vector3d)
 
     @JvmStatic
@@ -166,6 +322,7 @@ object ShipAssembler {
         toCenter: Vector3i,
         removeOriginal: Boolean = true)
     : MoveContext {
+        val totalStart = phaseStart()
         val blocks = blocks.filter { level.getBlockState(it).let{!it.isAir && !it.inAssemblyBlacklist()} }.toSet()
         if (blocks.isEmpty()) return failedMove
 
@@ -188,35 +345,39 @@ object ShipAssembler {
             splittingDisabler?.disableSplitting()
         }
 
-        // ========== Copy Blocks
-        VSAssemblyEvents.beforeCopy.emit(VSAssemblyEvents.BeforeCopy(level, oldMin, oldMax, fromCenter, fromShip, blocks, eventData))
+        // structure template builds from a corner, so offset center of plot so that structure's center and center of
+        // plot roughly align
+        val cornerOfShip = Vector3d(toCenter)
+            .sub(offset)
+            .ceil()
+            .let {
+                BlockPos(
+                    it.x.toInt(),
+                    it.y.toInt(),
+                    it.z.toInt(),
+                )
+            }
 
-        val template = StructureTemplate()
-        template as StructureTemplateFillFromVoxelSet
-        template.`vs$fillFromVoxelSet`(
-            level, blocks,
-            fromShip?.let { listOf(it) } ?: emptyList(),
-            SingleItemMap(fromId, fromCenter, Vector3d()),
-            minStructurePos, maxStructurePos
+        val centerOfShip = cornerOfShip.toJOMLD().add(offset)
+        val shipsBeingCopied = fromShip?.let { listOf(it) } ?: emptyList()
+        val oldShipIdToNewShipId = SingleItemMap(fromId, toShip?.id ?: -1L, -1L) { it }
+        val centerPositionMap = SingleItemMap(fromId, Pair(fromCenter, Vector3d(centerOfShip)), Pair(Vector3d(), Vector3d()))
+
+        // ========== Snapshot / Copy Data
+        VSAssemblyEvents.beforeCopy.emit(VSAssemblyEvents.BeforeCopy(level, oldMin, oldMax, fromCenter, fromShip, blocks, eventData))
+        val snapshotStart = phaseStart()
+        val snapshot = buildAssemblySnapshot(
+            level,
+            blocks,
+            minStructurePos,
+            cornerOfShip,
+            shipsBeingCopied,
+            SingleItemMap(fromId, fromCenter, Vector3d())
         )
+        logPhase("Assembly snapshot", snapshotStart)
 
         // ========== Pause Chunk Updates
-
-        val toChunkCenter = ChunkPos(toCenter.x.toInt() shr 4, toCenter.z.toInt() shr 4)
-
-        val fromChunkX = ((minStructurePos.x + maxStructurePos.x) / 2) shr 4
-        val fromChunkZ = ((minStructurePos.z + maxStructurePos.z) / 2) shr 4
-
-        val deltaX = fromChunkX - toChunkCenter.x
-        val deltaZ = fromChunkZ - toChunkCenter.z
-
-        val chunksToBeUpdated = mutableMapOf<ChunkPos, Pair<ChunkPos, ChunkPos>>()
-        getDistinctChunksFromBlockPosSet(blocks).forEach { sourcePos ->
-            val destPos = ChunkPos(sourcePos.x - deltaX, sourcePos.z - deltaZ)
-            chunksToBeUpdated[sourcePos] = Pair(sourcePos, destPos)
-        }
-        val chunkPairs = chunksToBeUpdated.values.toList()
-        val chunkPoses = chunkPairs.flatMap { it.toList() }
+        val chunkPoses = snapshot.changedChunks.toList()
         val chunkPosesJOML = chunkPoses.map { it.toJOML() }
 
         level.players().forEach { player ->
@@ -226,68 +387,11 @@ object ShipAssembler {
             }
         }
 
-        // ========== Removing Old Blocks
-        if (removeOriginal) {
-            for (pos in blocks) {
-                level.getBlockEntity(pos)?.let {
-                    if (it is Clearable) {
-                        Clearable.tryClear(it)
-                    } else {
-                        // Clear all NBT if it doesn't implement IClearable
-                        it.load(CompoundTag())
-                    }
-                    // Without this, copycats still drop their items
-                    level.removeBlockEntity(pos)
-                }
-
-                level.setBlock(pos, Blocks.BARRIER.defaultBlockState(), Block.UPDATE_CLIENTS)
-            }
-            for (pos in blocks) {
-                val block = level.getBlockState(pos)
-                level.removeBlock(pos, false)
-                // 75 = flag 1 (block update) & flag 2 (send to clients) + flag 8 (force rerenders)
-                val flags = 11 or Block.UPDATE_MOVE_BY_PISTON or Block.UPDATE_SUPPRESS_DROPS
-
-                //updateNeighbourShapes recurses through nearby blocks, recursionLeft is the limit
-                val recursionLeft = 511
-
-                level.setBlocksDirty(pos, block, AIR)
-                level.sendBlockUpdated(pos, block, AIR, flags)
-                level.blockUpdated(pos, AIR.block)
-                // This handles the update for neighboring blocks in worldspace
-                AIR.updateIndirectNeighbourShapes(level, pos, flags, recursionLeft - 1)
-                AIR.updateNeighbourShapes(level, pos, flags, recursionLeft)
-                AIR.updateIndirectNeighbourShapes(level, pos, flags, recursionLeft)
-                //This updates lighting for blocks in worldspace
-                level.chunkSource.lightEngine.checkBlock(pos)
-            }
-        }
-        // ========== Placing New Blocks
-
-        //structure template builds from a corner, so offset center of plot so that structure's center and center of
-        //plot roughly align
-        val cornerOfShip = Vector3d(toCenter)
-            .sub(offset)
-            .ceil()
-            .let { BlockPos(
-                it.x.toInt(),
-                it.y.toInt(),
-                it.z.toInt(),
-            ) }
-
-        val centerOfShip = cornerOfShip.toJOMLD().add(offset)
-
-        val structureSettings = StructurePlaceSettings().addProcessor(
-            ICopyableProcessor(
-                SingleItemMap(fromId, toShip?.id ?: -1L, -1L) {it},
-                SingleItemMap(fromId, Pair(fromCenter, Vector3d(centerOfShip)), Pair(Vector3d(), Vector3d()))
-            )
-        )
-
-        structureSettings.rotationPivot = cornerOfShip
-
+        // ========== Apply Snapshot
         VSAssemblyEvents.onPasteBeforeBlocksAreLoaded.emit(VSAssemblyEvents.OnPasteBeforeBlocksAreLoaded(level, fromShip, toShip, Pair(fromCenter, centerOfShip), eventData))
-        template.placeInWorld(level, cornerOfShip, cornerOfShip, structureSettings, level.random, Block.UPDATE_CLIENTS)
+        val applyStart = phaseStart()
+        applyAssemblySnapshot(level, snapshot, oldShipIdToNewShipId, centerPositionMap, removeOriginal)
+        logPhase("Assembly batch mutate", applyStart)
 
         // ========== Resume Chunk Updates
         val timeAtExecution = level.server.tickCount
@@ -301,7 +405,34 @@ object ShipAssembler {
                 ASSEMBLY_LOGGER.warn("All chunks involved in assembly: $chunkPoses")
                 ASSEMBLY_LOGGER.warn("Chunks that were supposed to be ticking: ${chunkPoses.filterNot { level.isTickingChunk(it) }}")
             }
+            val finalizeStart = phaseStart()
+            snapshot.changedBlockPositions.forEach(level.chunkSource.lightEngine::checkBlock)
+
+            // Force connectivity to match the batched chunk mutation we just performed.
+            if (VSCoreConfig.SERVER.sp.enableConnectivity) {
+                for (sectionPos in snapshot.changedSections) {
+                    val worldChunk = level.getChunk(sectionPos.x, sectionPos.z) ?: continue
+                    val sectionIndex = worldChunk.getSectionIndexFromSectionY(sectionPos.y)
+                    if (sectionIndex !in 0 until worldChunk.sectionsCount) continue
+                    val section = worldChunk.sections[sectionIndex] ?: continue
+                    val update = if (section.hasOnlyAir()) {
+                        vsCore.newEmptyVoxelShapeUpdate(sectionPos.x, sectionPos.y, sectionPos.z, true)
+                    } else {
+                        section.toDenseVoxelUpdate(sectionPos)
+                    }
+                    level.shipObjectWorld.forceUpdateConnectivityChunk(
+                        level.dimensionId,
+                        sectionPos.x,
+                        sectionPos.y,
+                        sectionPos.z,
+                        update
+                    )
+                }
+            }
+            logPhase("Assembly finalize", finalizeStart)
+
             // Once all the chunk updates are sent to players, we can tell them to restart chunk updates
+            val restartStart = phaseStart()
             level.players().forEach { player ->
                 ASSEMBLY_LOGGER.debug("Resuming chunk updates for ${player.name}")
                 with (vsCore.simplePacketNetworking) {
@@ -309,26 +440,7 @@ object ShipAssembler {
                 }
             }
             VSAssemblyEvents.onPasteAfterBlocksAreLoaded.emit(VSAssemblyEvents.OnPasteAfterBlocksAreLoaded(level, fromShip, toShip, Pair(fromCenter, centerOfShip), eventData))
-            //force update connectivity because this new assemblyslop doesn't update it :(
-            if (VSCoreConfig.SERVER.sp.enableConnectivity) {
-                for (pos in chunkPoses) {
-                    val worldChunk = level.getChunk(pos.x, pos.z) ?: continue
-                    val chunkSections = worldChunk.sections ?: continue
-                    for (sectionY in 0 until worldChunk.sectionsCount) {
-                        val sectionPos = Vector3i(pos.x, worldChunk.getSectionYFromSectionIndex(sectionY), pos.z)
-                        val section = chunkSections[sectionY] ?: continue
-                        if (section.hasOnlyAir()) continue
-                        val update = section.toDenseVoxelUpdate(sectionPos)
-                        level.shipObjectWorld.forceUpdateConnectivityChunk(
-                            level.dimensionId,
-                            sectionPos.x,
-                            sectionPos.y,
-                            sectionPos.z,
-                            update
-                        )
-                    }
-                }
-            }
+            logPhase("Assembly restart flush", restartStart)
 
             if (fromShip is LoadedServerShip) {
                 val splittingDisabler = fromShip.getAttachment(SplittingDisablerAttachment::class.java)
@@ -336,6 +448,7 @@ object ShipAssembler {
                     splittingDisabler?.enableSplitting()
                 }
             }
+            logPhase("Assembly total (including deferred finalize)", totalStart)
         }
 
         return MoveContext(true, fromCenter, centerOfShip)
