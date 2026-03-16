@@ -2,6 +2,7 @@ package org.valkyrienskies.mod.common.assembly
 
 import net.minecraft.core.BlockPos
 import net.minecraft.core.SectionPos
+import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket
 import net.minecraft.nbt.CompoundTag
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.Clearable
@@ -15,6 +16,7 @@ import net.minecraft.world.level.block.EntityBlock
 import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.entity.RandomizableContainerBlockEntity
 import net.minecraft.world.level.block.state.BlockState
+import net.minecraft.world.level.chunk.LevelChunk
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructurePlaceSettings
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureProcessor
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureProcessorType
@@ -31,7 +33,6 @@ import org.valkyrienskies.core.impl.config.VSCoreConfig
 import org.valkyrienskies.core.internal.ships.VsiServerShip
 import org.valkyrienskies.mod.common.config.VSGameConfig
 import org.valkyrienskies.mod.common.dimensionId
-import org.valkyrienskies.mod.common.executeIf
 import org.valkyrienskies.mod.common.forEach
 import org.valkyrienskies.mod.common.getLoadedShipManagingPos
 import org.valkyrienskies.mod.common.getShipManagingPos
@@ -221,16 +222,20 @@ object ShipAssembler {
         centerPositions: Map<Long, Pair<Vector3d, Vector3d>>,
         removeOriginal: Boolean
     ) {
+        val chunkCache = HashMap<Long, LevelChunk>()
+        fun getChunk(pos: BlockPos) =
+            chunkCache.getOrPut(ChunkPos.asLong(pos.x shr 4, pos.z shr 4)) { level.getChunk(pos.x shr 4, pos.z shr 4) }
+
         if (removeOriginal) {
             for (entry in snapshot.blocks) {
                 clearSourceBlockEntity(level, entry.sourcePos)
-                level.getChunk(entry.sourcePos).setBlockState(entry.sourcePos, AIR, false)
+                getChunk(entry.sourcePos).setBlockState(entry.sourcePos, AIR, false)
             }
         }
 
         for (entry in snapshot.blocks) {
             level.removeBlockEntity(entry.destPos)
-            level.getChunk(entry.destPos).setBlockState(entry.destPos, entry.state, false)
+            getChunk(entry.destPos).setBlockState(entry.destPos, entry.state, false)
 
             val block = entry.state.block
             val finalTag = if (block is ICopyableBlock) {
@@ -248,8 +253,18 @@ object ShipAssembler {
                 }
             }
         }
+    }
 
-        snapshot.changedBlockPositions.forEach(level.chunkSource::blockChanged)
+    private fun sendChunkRefreshPackets(level: ServerLevel, changedChunks: Iterable<ChunkPos>) {
+        val chunkMap = level.chunkSource.chunkMap
+        val lightEngine = level.chunkSource.lightEngine
+        for (chunkPos in changedChunks) {
+            val players = chunkMap.getPlayers(chunkPos, false)
+            if (players.isEmpty()) continue
+
+            val packet = ClientboundLevelChunkWithLightPacket(level.getChunk(chunkPos.x, chunkPos.z), lightEngine, null, null)
+            players.forEach { player -> player.connection.send(packet) }
+        }
     }
 
     data class AssembleContext(val ship: ServerShip, val fromCenter: Vector3d, val toCenter: Vector3d)
@@ -393,63 +408,54 @@ object ShipAssembler {
         applyAssemblySnapshot(level, snapshot, oldShipIdToNewShipId, centerPositionMap, removeOriginal)
         logPhase("Assembly batch mutate", applyStart)
 
-        // ========== Resume Chunk Updates
-        val timeAtExecution = level.server.tickCount
-        level.server.executeIf(
-            // This condition will return true if all modified chunks have been both loaded AND
-            // chunk update packets were sent to players
-            { chunkPoses.all(level::isTickingChunk) || level.server.tickCount - timeAtExecution > 60 }
-        ) {
-            if (level.server.tickCount - timeAtExecution > 60) {
-                ASSEMBLY_LOGGER.warn("Timed out waiting for chunks to start ticking after assembly! Forcibly resuming...")
-                ASSEMBLY_LOGGER.warn("All chunks involved in assembly: $chunkPoses")
-                ASSEMBLY_LOGGER.warn("Chunks that were supposed to be ticking: ${chunkPoses.filterNot { level.isTickingChunk(it) }}")
-            }
-            val finalizeStart = phaseStart()
-            snapshot.changedBlockPositions.forEach(level.chunkSource.lightEngine::checkBlock)
+        val finalizeStart = phaseStart()
+        snapshot.changedBlockPositions.forEach(level.chunkSource.lightEngine::checkBlock)
 
-            // Force connectivity to match the batched chunk mutation we just performed.
-            if (VSCoreConfig.SERVER.sp.enableConnectivity) {
-                for (sectionPos in snapshot.changedSections) {
-                    val worldChunk = level.getChunk(sectionPos.x, sectionPos.z) ?: continue
-                    val sectionIndex = worldChunk.getSectionIndexFromSectionY(sectionPos.y)
-                    if (sectionIndex !in 0 until worldChunk.sectionsCount) continue
-                    val section = worldChunk.sections[sectionIndex] ?: continue
-                    val update = if (section.hasOnlyAir()) {
-                        vsCore.newEmptyVoxelShapeUpdate(sectionPos.x, sectionPos.y, sectionPos.z, true)
-                    } else {
-                        section.toDenseVoxelUpdate(sectionPos)
-                    }
-                    level.shipObjectWorld.forceUpdateConnectivityChunk(
-                        level.dimensionId,
-                        sectionPos.x,
-                        sectionPos.y,
-                        sectionPos.z,
-                        update
-                    )
+        // Force connectivity to match the batched chunk mutation we just performed.
+        if (VSCoreConfig.SERVER.sp.enableConnectivity) {
+            for (sectionPos in snapshot.changedSections) {
+                val worldChunk = level.getChunk(sectionPos.x, sectionPos.z) ?: continue
+                val sectionIndex = worldChunk.getSectionIndexFromSectionY(sectionPos.y)
+                if (sectionIndex !in 0 until worldChunk.sectionsCount) continue
+                val section = worldChunk.sections[sectionIndex] ?: continue
+                val update = if (section.hasOnlyAir()) {
+                    vsCore.newEmptyVoxelShapeUpdate(sectionPos.x, sectionPos.y, sectionPos.z, true)
+                } else {
+                    section.toDenseVoxelUpdate(sectionPos)
                 }
+                level.shipObjectWorld.forceUpdateConnectivityChunk(
+                    level.dimensionId,
+                    sectionPos.x,
+                    sectionPos.y,
+                    sectionPos.z,
+                    update
+                )
             }
-            logPhase("Assembly finalize", finalizeStart)
-
-            // Once all the chunk updates are sent to players, we can tell them to restart chunk updates
-            val restartStart = phaseStart()
-            level.players().forEach { player ->
-                ASSEMBLY_LOGGER.debug("Resuming chunk updates for ${player.name}")
-                with (vsCore.simplePacketNetworking) {
-                    PacketRestartChunkUpdates(chunkPosesJOML).sendToClient(player.playerWrapper)
-                }
-            }
-            VSAssemblyEvents.onPasteAfterBlocksAreLoaded.emit(VSAssemblyEvents.OnPasteAfterBlocksAreLoaded(level, fromShip, toShip, Pair(fromCenter, centerOfShip), eventData))
-            logPhase("Assembly restart flush", restartStart)
-
-            if (fromShip is LoadedServerShip) {
-                val splittingDisabler = fromShip.getAttachment(SplittingDisablerAttachment::class.java)
-                if (wasSplittingEnabled) {
-                    splittingDisabler?.enableSplitting()
-                }
-            }
-            logPhase("Assembly total (including deferred finalize)", totalStart)
         }
+        logPhase("Assembly finalize", finalizeStart)
+
+        val refreshStart = phaseStart()
+        sendChunkRefreshPackets(level, chunkPoses)
+        logPhase("Assembly chunk refresh", refreshStart)
+
+        // Once all chunk refreshes are queued to players, we can tell them to restart chunk updates immediately.
+        val restartStart = phaseStart()
+        level.players().forEach { player ->
+            ASSEMBLY_LOGGER.debug("Resuming chunk updates for ${player.name}")
+            with (vsCore.simplePacketNetworking) {
+                PacketRestartChunkUpdates(chunkPosesJOML).sendToClient(player.playerWrapper)
+            }
+        }
+        VSAssemblyEvents.onPasteAfterBlocksAreLoaded.emit(VSAssemblyEvents.OnPasteAfterBlocksAreLoaded(level, fromShip, toShip, Pair(fromCenter, centerOfShip), eventData))
+        logPhase("Assembly restart flush", restartStart)
+
+        if (fromShip is LoadedServerShip) {
+            val splittingDisabler = fromShip.getAttachment(SplittingDisablerAttachment::class.java)
+            if (wasSplittingEnabled) {
+                splittingDisabler?.enableSplitting()
+            }
+        }
+        logPhase("Assembly total", totalStart)
 
         return MoveContext(true, fromCenter, centerOfShip)
     }
