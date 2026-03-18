@@ -2,6 +2,7 @@ package org.valkyrienskies.mod.common.config
 
 import com.google.gson.Gson
 import com.google.gson.JsonElement
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap
 import net.minecraft.core.BlockPos
 import net.minecraft.core.HolderSet
 import net.minecraft.core.registries.BuiltInRegistries
@@ -37,6 +38,7 @@ import org.valkyrienskies.mod.common.vsCore
 import org.valkyrienskies.mod.mixin.accessors.world.level.block.SlabBlockAccessor
 import org.valkyrienskies.mod.mixin.accessors.world.level.block.StairBlockAccessor
 import org.valkyrienskies.mod.util.logger
+import java.util.IdentityHashMap
 import java.util.Optional
 import kotlin.math.roundToInt
 
@@ -52,20 +54,112 @@ private data class VSBlockStateInfo(
 
 object MassDatapackResolver : BlockStateInfoProvider {
     private val map = hashMapOf<ResourceLocation, VSBlockStateInfo>()
-    private val mcBlockStateToVs: MutableMap<BlockState, VsiBlockState> = HashMap()
+    private val mcBlockStateToVs = Int2ObjectOpenHashMap<VsiBlockState>(4096, 0.5f)
+    private val blockStateInfoCache = Int2ObjectOpenHashMap<VSBlockStateInfo?>(4096, 0.5f)
 
-    val blockStateData: Collection<VsiBlockState> = mcBlockStateToVs.values
+    val blockStateData: Collection<VsiBlockState> get() = mcBlockStateToVs.values
 
     val loader get() = VSMassDataLoader()
+
+    private fun newLiquidMaterialDensityMap() = hashMapOf<Fluid, Pair<Double, Double>>(
+        Fluids.WATER to Pair(1000.0, 0.3),
+        Fluids.LAVA to Pair(10000.0, 1.0),
+        Fluids.FLOWING_WATER to Pair(1000.0, 0.3),
+        Fluids.FLOWING_LAVA to Pair(10000.0, 1.0)
+    )
+
+    private val dummyBlockGetter = object : BlockGetter {
+        override fun getHeight(): Int = 255
+
+        override fun getMinBuildHeight(): Int = 0
+
+        override fun getBlockEntity(blockPos: BlockPos): BlockEntity? = null
+
+        override fun getBlockState(blockPos: BlockPos): BlockState = Blocks.VOID_AIR.defaultBlockState()
+
+        override fun getFluidState(blockPos: BlockPos): FluidState = Fluids.EMPTY.defaultFluidState()
+    }
+
+    private val fullBlockCollisionPoints = listOf(
+        CollisionPoint(.25f, .25f, .25f, .25f),
+        CollisionPoint(.25f, .25f, .75f, .25f),
+        CollisionPoint(.25f, .75f, .25f, .25f),
+        CollisionPoint(.25f, .75f, .75f, .25f),
+        CollisionPoint(.75f, .25f, .25f, .25f),
+        CollisionPoint(.75f, .25f, .75f, .25f),
+        CollisionPoint(.75f, .75f, .25f, .25f),
+        CollisionPoint(.75f, .75f, .75f, .25f),
+    )
+
+    private val fullBlockCollisionShape by lazy {
+        vsCore.newSolidStateBoxesShapeBuilder()
+            .addCollisionPoints(fullBlockCollisionPoints)
+            .addPositiveBox(AABBi(0, 0, 0, 15, 15, 15))
+            .build()
+    }
+
+    private val emptyBlockCollisionShape by lazy {
+        vsCore.solidShapeUtils.generateShapeFromBoxes(mutableListOf())!!
+    }
+
+    private val commonVoxelShapeToCollisionShapeMap: MutableMap<VoxelShape, SolidBlockShape> by lazy {
+        IdentityHashMap<VoxelShape, SolidBlockShape>().apply {
+            putAll(
+                generateStairCollisionShapes(
+                    StairBlockAccessor.getTopShapes() +
+                        StairBlockAccessor.getBottomShapes() +
+                        SlabBlockAccessor.getBottomAABB() +
+                        SlabBlockAccessor.getTopAABB()
+                )
+            )
+        }
+    }
+
+    private val generatedCollisionShapesMap: MutableMap<VoxelShape, SolidBlockShape?> = IdentityHashMap()
+    private var liquidMaterialToDensityMap = newLiquidMaterialDensityMap()
+
+    private data class FluidCacheKey(
+        val fluid: Fluid,
+        val maxY: Int,
+        val densityBits: Long,
+        val dragBits: Long
+    )
+
+    private val fluidShapeCache = HashMap<FluidCacheKey, LiquidState>()
+
+    private fun invalidateCaches() {
+        registeredBlocks = false
+        mcBlockStateToVs.clear()
+        blockStateInfoCache.clear()
+        fluidShapeCache.clear()
+        liquidMaterialToDensityMap = newLiquidMaterialDensityMap()
+    }
+
+    private fun getBlockInfo(blockState: BlockState): VSBlockStateInfo? {
+        val blockStateId = Block.getId(blockState)
+        if (blockStateId == -1) {
+            return null
+        }
+        if (blockStateInfoCache.containsKey(blockStateId)) {
+            return blockStateInfoCache[blockStateId]
+        }
+        val blockInfo = map[BuiltInRegistries.BLOCK.getKey(blockState.block)]
+        blockStateInfoCache[blockStateId] = blockInfo
+        return blockInfo
+    }
 
     override val priority: Int
         get() = 100
 
     override fun getBlockStateMass(blockState: BlockState): Double? =
-        map[BuiltInRegistries.BLOCK.getKey(blockState.block)]?.mass
+        getBlockInfo(blockState)?.mass
 
     override fun getBlockStateType(blockState: BlockState): VsiBlockType? {
-        val vsState = mcBlockStateToVs[blockState] ?: return null
+        val blockStateId = Block.getId(blockState)
+        if (blockStateId == -1) {
+            return null
+        }
+        val vsState = mcBlockStateToVs[blockStateId] ?: return null
         return vsCore.blockTypes.getType(vsState)
     }
 
@@ -82,6 +176,7 @@ object MassDatapackResolver : BlockStateInfoProvider {
         ) {
             map.clear()
             tags.clear()
+            invalidateCaches()
             objects?.forEach { (location, element) ->
                 try {
                     if (element.isJsonArray) {
@@ -117,6 +212,7 @@ object MassDatapackResolver : BlockStateInfoProvider {
                                 )
                             )
                         }
+                        invalidateCaches()
                     }
                 }
             }
@@ -278,128 +374,76 @@ object MassDatapackResolver : BlockStateInfoProvider {
      * It is **not recommended** to call this yourself!
      */
     fun registerAllBlockStates(blockStates: Iterable<BlockState>) {
-        val fullLodBoundingBox = AABBi(0, 0, 0, 15, 15, 15)
-        val fullBlockCollisionPoints = listOf(
-            CollisionPoint(.25f, .25f, .25f, .25f),
-            CollisionPoint(.25f, .25f, .75f, .25f),
-            CollisionPoint(.25f, .75f, .25f, .25f),
-            CollisionPoint(.25f, .75f, .75f, .25f),
-            CollisionPoint(.75f, .25f, .25f, .25f),
-            CollisionPoint(.75f, .25f, .75f, .25f),
-            CollisionPoint(.75f, .75f, .25f, .25f),
-            CollisionPoint(.75f, .75f, .75f, .25f),
-        )
-        val fullBlockCollisionShape = vsCore.newSolidStateBoxesShapeBuilder()
-            .addCollisionPoints(fullBlockCollisionPoints)
-            .addPositiveBox(fullLodBoundingBox)
-            .build()
-
-        // A dummy world used to get the VoxelShape for each block state
-        val dummyBlockGetter = object: BlockGetter {
-            override fun getHeight(): Int = 255
-
-            override fun getMinBuildHeight(): Int = 0
-
-            override fun getBlockEntity(blockPos: BlockPos): BlockEntity? = null
-
-            override fun getBlockState(blockPos: BlockPos): BlockState = Blocks.VOID_AIR.defaultBlockState()
-
-            override fun getFluidState(blockPos: BlockPos): FluidState = Fluids.EMPTY.defaultFluidState()
-        }
-
-        // Create a map of common VoxelShape to Lod1SolidCollisionShape
-        val voxelShapeToCollisionShapeMap = generateStairCollisionShapes(
-            StairBlockAccessor.getTopShapes() + StairBlockAccessor.getBottomShapes() + SlabBlockAccessor.getBottomAABB() + SlabBlockAccessor.getTopAABB()
-        )
-
-        val generatedCollisionShapesMap = HashMap<VoxelShape, SolidBlockShape?>()
-        val liquidMaterialToDensityMap: HashMap<Fluid, Pair<Double, Double>> = hashMapOf(Fluids.WATER to Pair(1000.0, 0.3), Fluids.LAVA to Pair(10000.0, 1.0), Fluids.FLOWING_WATER to Pair(1000.0, 0.3), Fluids.FLOWING_LAVA to Pair(10000.0, 1.0))
-
-        val fluidStateToBlockTypeMap = HashMap<FluidState, LiquidState>()
+        mcBlockStateToVs.clear()
+        blockStateInfoCache.clear()
 
         // Get the id of the fluid state/create a new fluid state if necessary
         fun getFluidState(fluidState: FluidState, blockStateInfo: VSBlockStateInfo?, isLiquid: Boolean = false): LiquidState {
-            val cached = fluidStateToBlockTypeMap[fluidState]
-            if (cached != null) return cached
             val maxY = ((fluidState.ownHeight * 16.0).roundToInt() - 1).coerceIn(0, 15)
-            val fluidBox = AABBi(0, 0, 0, 15, maxY, 15)
-            return if (fluidState.type in liquidMaterialToDensityMap) {
-                val (density, dragCoefficient) = liquidMaterialToDensityMap[fluidState.type]!!
-                val newFluidBlockState = vsCore.newLiquidStateBuilder()
-                    .boxShape(fluidBox)
-                    .density(density)
-                    .dragCoefficient(dragCoefficient)
-                    .velocity(Vector3d())
-                    .build()
-
-                newFluidBlockState
+            val densityAndDrag = if (fluidState.type in liquidMaterialToDensityMap) {
+                liquidMaterialToDensityMap[fluidState.type]!!
+            } else if (isLiquid) {
+                val density = blockStateInfo?.mass ?: VSGameConfig.SERVER.defaultBlockMass
+                val dragCoefficient = blockStateInfo?.friction ?: VSGameConfig.SERVER.defaultBlockFriction
+                liquidMaterialToDensityMap[fluidState.type] = density to dragCoefficient
+                density to dragCoefficient
             } else {
-                if (isLiquid) {
-                    val density = blockStateInfo?.mass ?: VSGameConfig.SERVER.defaultBlockMass
-                    val dragCoefficient = blockStateInfo?.friction ?: VSGameConfig.SERVER.defaultBlockFriction
-                    val newFluidBlockState = vsCore.newLiquidStateBuilder()
-                        .boxShape(fluidBox)
-                        .density(density)
-                        .dragCoefficient(dragCoefficient)
-                        .velocity(Vector3d())
-                        .build()
-
-                    liquidMaterialToDensityMap[fluidState.type] = Pair(density, dragCoefficient)
-                    newFluidBlockState
-                } else {
-                    //default
-                    val newFluidBlockState = vsCore.newLiquidStateBuilder()
-                        .boxShape(fluidBox)
-                        .density(VSGameConfig.SERVER.defaultBlockMass)
-                        .dragCoefficient(liquidMaterialToDensityMap[Fluids.WATER]!!.second)
-                        .velocity(Vector3d())
-                        .build()
-                    newFluidBlockState
-                }
+                VSGameConfig.SERVER.defaultBlockMass to liquidMaterialToDensityMap[Fluids.WATER]!!.second
             }
+
+            val cacheKey = FluidCacheKey(
+                fluidState.type,
+                maxY,
+                java.lang.Double.doubleToLongBits(densityAndDrag.first),
+                java.lang.Double.doubleToLongBits(densityAndDrag.second)
+            )
+            val cached = fluidShapeCache[cacheKey]
+            if (cached != null) return cached
+            val fluidBox = AABBi(0, 0, 0, 15, maxY, 15)
+            val (density, dragCoefficient) = densityAndDrag
+            return vsCore.newLiquidStateBuilder()
+                .boxShape(fluidBox)
+                .density(density)
+                .dragCoefficient(dragCoefficient)
+                .velocity(Vector3d())
+                .build()
+                .also { fluidShapeCache[cacheKey] = it }
         }
 
+        fun getCollisionShape(blockState: BlockState, blockInfo: VSBlockStateInfo?): SolidBlockShape {
+            val voxelShape = if (blockState.isSolid) {
+                blockState.getShape(dummyBlockGetter, BlockPos.ZERO)
+            } else {
+                blockState.getCollisionShape(dummyBlockGetter, BlockPos.ZERO)
+            }
+
+            var collisionShape = commonVoxelShapeToCollisionShapeMap[voxelShape]
+                ?: generatedCollisionShapesMap.getOrPut(voxelShape) { generateShapeFromVoxel(voxelShape) }
+                ?: fullBlockCollisionShape
+
+            if (blockInfo?.noCollisionOverride == true) {
+                collisionShape = emptyBlockCollisionShape
+            }
+
+            return collisionShape
+        }
 
         blockStates.forEach { blockState: BlockState ->
+            val blockStateId = Block.getId(blockState)
+            if (blockStateId == -1) {
+                return@forEach
+            }
             val vsBlockState: VsiBlockState
             if (blockState.isAir) {
                 vsBlockState = vsCore.blockTypes.airState
             } else {
+                val vsBlockStateInfo = getBlockInfo(blockState)
                 vsBlockState = if (blockState.liquid()) { //TODO: This is also deprecated. I could check if the blockState is wet and not waterlogged but couldn't be sure if that's what this is for.
-                    VsiBlockState(null, getFluidState(blockState.fluidState, map[BuiltInRegistries.BLOCK.getKey(blockState.block)], true))
+                    VsiBlockState(null, getFluidState(blockState.fluidState, vsBlockStateInfo, true))
                 } else {
-                    val voxelShape: VoxelShape
-                    if (blockState.isSolid) {
-                        voxelShape = blockState.getShape(dummyBlockGetter, BlockPos.ZERO)
-                    } else {
-                        voxelShape = blockState.getCollisionShape(dummyBlockGetter, BlockPos.ZERO)
-                    }
-
-                    var collisionShape: SolidBlockShape = if (voxelShapeToCollisionShapeMap.contains(voxelShape)) {
-                        voxelShapeToCollisionShapeMap[voxelShape]!!
-                    } else if (generatedCollisionShapesMap.contains(voxelShape)) {
-                        if (generatedCollisionShapesMap[voxelShape] != null) {
-                            generatedCollisionShapesMap[voxelShape]!!
-                        } else {
-                            fullBlockCollisionShape
-                        }
-                    } else {
-                        val generated = generateShapeFromVoxel(voxelShape)
-                        generatedCollisionShapesMap[voxelShape] = generated
-                        generated ?: fullBlockCollisionShape
-                    }
-
-                    val vsBlockStateInfo = map[BuiltInRegistries.BLOCK.getKey(blockState.block)]
-
-                    // If overrideNoCollision is set to true in datapack, force it to have no collision shape
-                    if (vsBlockStateInfo?.noCollisionOverride ?: false) {
-                        // Won't ever be null with an empty list
-                        collisionShape = vsCore.solidShapeUtils.generateShapeFromBoxes(mutableListOf())!!
-                    }
-
                     // Create new solid block state
                     var solidState = vsCore.newSolidStateBuilder()
-                        .shape(collisionShape)
+                        .shape(getCollisionShape(blockState, vsBlockStateInfo))
                         .elasticity(vsBlockStateInfo?.elasticity ?: VSGameConfig.SERVER.defaultBlockElasticity)
                         .friction(vsBlockStateInfo?.friction ?: VSGameConfig.SERVER.defaultBlockFriction)
                         .hardness(VSGameConfig.SERVER.defaultBlockHardness) // Unused for now, placeholder for later
@@ -415,7 +459,7 @@ object MassDatapackResolver : BlockStateInfoProvider {
 
                 }
             }
-            mcBlockStateToVs[blockState] = vsBlockState
+            mcBlockStateToVs[blockStateId] = vsBlockState
         }
 
         runRegisterBlockStateEvent()
@@ -425,7 +469,12 @@ object MassDatapackResolver : BlockStateInfoProvider {
     private fun runRegisterBlockStateEvent() {
         val event = RegisterBlockStateEventImpl()
         ValkyrienSkiesMod.api.registerBlockStateEvent.emit(event)
-        mcBlockStateToVs.putAll(event.toRegister)
+        event.toRegister.forEach { (blockState, vsiBlockState) ->
+            val blockStateId = Block.getId(blockState)
+            if (blockStateId != -1) {
+                mcBlockStateToVs[blockStateId] = vsiBlockState
+            }
+        }
     }
 
     private val logger by logger()

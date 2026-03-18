@@ -20,6 +20,7 @@ import org.valkyrienskies.mod.common.config.VSGameConfig
 import org.valkyrienskies.mod.common.dimensionId
 import org.valkyrienskies.mod.common.shipObjectWorld
 import org.valkyrienskies.mod.util.logger
+import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
 
 class SplitHandler(private val doEdges: Boolean, private val doCorners: Boolean) {
@@ -146,13 +147,23 @@ class SplitHandler(private val doEdges: Boolean, private val doCorners: Boolean)
                             return
                         }
 
+                        val futures = ArrayList<CompletableFuture<ServerShip>>(toAssemble.size)
                         for (component in toAssemble) {
                             if (component.isEmpty()) continue
-                            val newShip = ShipAssembler.assembleToShip(level, component, 1.0)
-                            if (after != null) after.accept(newShip)
+                            futures += ShipAssembler.queueAssembleToShip(level, component, 1.0).thenApply { newShip ->
+                                after?.accept(newShip)
+                                newShip
+                            }
                         }
 
-                        loadedShip?.getAttachment(SplittingDisablerAttachment::class.java)?.enableSplitting()
+                        if (futures.isEmpty()) {
+                            loadedShip?.getAttachment(SplittingDisablerAttachment::class.java)?.enableSplitting()
+                            return
+                        }
+
+                        CompletableFuture.allOf(*futures.toTypedArray()).whenComplete { _, _ ->
+                            loadedShip?.getAttachment(SplittingDisablerAttachment::class.java)?.enableSplitting()
+                        }
                     }
                 }
             }

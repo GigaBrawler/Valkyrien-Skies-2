@@ -58,6 +58,7 @@ import org.valkyrienskies.mod.common.IShipObjectWorldServerProvider;
 import org.valkyrienskies.mod.common.ShipSavedData;
 import org.valkyrienskies.mod.common.VSGameUtilsKt;
 import org.valkyrienskies.mod.common.ValkyrienSkiesMod;
+import org.valkyrienskies.mod.common.assembly.AssemblyScheduler;
 import org.valkyrienskies.mod.common.config.DimensionParametersResolver;
 import org.valkyrienskies.mod.common.config.MassDatapackResolver;
 import org.valkyrienskies.mod.common.hooks.VSGameEvents;
@@ -105,6 +106,7 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
 
     @Inject(at = @At("TAIL"), method = "stopServer")
     private void afterStopServer(final CallbackInfo ci) {
+        AssemblyScheduler.INSTANCE.clear();
         ValkyrienSkiesMod.setCurrentServer(null);
     }
 
@@ -219,6 +221,7 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
         loadedLevels = newLoadedLevels.keySet();
         // endregion
 
+        AssemblyScheduler.INSTANCE.tickServer(MinecraftServer.class.cast(this));
         vsPipeline.preTickGame();
     }
 
@@ -235,6 +238,7 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
     )
     private void preConnectionTick(final CallbackInfo ci) {
         ChunkManagement.tickChunkLoading(shipWorld, MinecraftServer.class.cast(this));
+        AssemblyScheduler.INSTANCE.tickServer(MinecraftServer.class.cast(this));
     }
 
     @Shadow

@@ -17,10 +17,12 @@ import org.joml.Vector3dc
 import org.valkyrienskies.core.api.ships.LoadedServerShip
 import org.valkyrienskies.core.api.ships.Ship
 import org.valkyrienskies.core.api.ships.Wing
+import org.valkyrienskies.core.api.ships.properties.ShipId
 import org.valkyrienskies.core.api.world.connectivity.ConnectionStatus
 import org.valkyrienskies.core.api.world.connectivity.SparseVoxelPosition
 import org.valkyrienskies.core.internal.world.chunks.VsiBlockType
 import org.valkyrienskies.mod.common.block.WingBlock
+import org.valkyrienskies.mod.common.assembly.CapturedBlockChange
 import org.valkyrienskies.mod.common.config.ConfigType
 import org.valkyrienskies.mod.common.config.MassDatapackResolver
 import org.valkyrienskies.mod.common.config.VSGameConfig
@@ -42,6 +44,10 @@ interface BlockStateInfoProvider {
 }
 
 object BlockStateInfo {
+    class DeferredServerEffects {
+        val buoyancyShipIds = LinkedHashSet<ShipId>()
+        val splitShipIds = LinkedHashSet<Long>()
+    }
 
     // registry for mods to add their weights
     val REGISTRY = MappedRegistry<BlockStateInfoProvider>(
@@ -125,6 +131,39 @@ object BlockStateInfo {
         onSetBlock(level, blockPos.x, blockPos.y, blockPos.z, prevBlockState, newBlockState)
 
     fun onSetBlock(level: Level, x: Int, y: Int, z: Int, prevBlockState: BlockState, newBlockState: BlockState) {
+        val deferredEffects = DeferredServerEffects()
+        replayBlockChange(level, x, y, z, prevBlockState, newBlockState, deferredEffects)
+        if (level is ServerLevel) {
+            finalizeDeferredServerEffects(level, deferredEffects)
+        }
+    }
+
+    fun replayCapturedBlockChange(level: Level, change: CapturedBlockChange, deferredEffects: DeferredServerEffects) {
+        replayBlockChange(level, change.pos.x, change.pos.y, change.pos.z, change.prevState, change.newState, deferredEffects)
+    }
+
+    fun finalizeDeferredServerEffects(level: ServerLevel, deferredEffects: DeferredServerEffects) {
+        deferredEffects.buoyancyShipIds.forEach { shipId ->
+            val loadedShip = level.shipObjectWorld.loadedShips.getById(shipId) ?: return@forEach
+            recomputePocketBuoyancy(level, loadedShip)
+        }
+
+        if (ValkyrienSkiesMod.vsCore.hooks.enableConnectivity) {
+            deferredEffects.splitShipIds.forEach { shipId ->
+                ValkyrienSkiesMod.splitHandler.queueSplit(level, if (shipId == -1L) null else shipId)
+            }
+        }
+    }
+
+    private fun replayBlockChange(
+        level: Level,
+        x: Int,
+        y: Int,
+        z: Int,
+        prevBlockState: BlockState,
+        newBlockState: BlockState,
+        deferredEffects: DeferredServerEffects
+    ) {
         if (!::SORTED_REGISTRY.isInitialized) return
 
         val shipObjectWorld = level.shipObjectWorld
@@ -160,69 +199,70 @@ object BlockStateInfo {
             newBlockMass
         )
 
-        fun Set<SparseVoxelPosition>.centerFromVoxelSet() : Vector3dc {
-            val center = Vector3d(0.0, 0.0, 0.0)
-            if (this.isEmpty()) {
-                return center
-            }
-            for (voxel in this) {
-                center.add(
-                    voxel.x.toDouble() + ((voxel.extent - 1L).toDouble() / 2.0) + 0.5,
-                    voxel.y.toDouble() + ((voxel.extent - 1L).toDouble() / 2.0) + 0.5,
-                    voxel.z.toDouble() + ((voxel.extent - 1L).toDouble() / 2.0) + 0.5
-                )
-            }
-            center.div(this.size.toDouble())
-            return center
-        }
-
         if (level is ServerLevel) {
             val loadedShip = level.getLoadedShipManagingPos(x shr 4, z shr 4)
-            if (loadedShip != null) {
-                if (VSGameConfig.SERVER.enablePocketBuoyancy) {
-                    val buoyancyHandler = loadedShip.getAttachment(BuoyancyHandlerAttachment::class.java)
-                    val dimension = loadedShip.chunkClaimDimension
-                    val allComponentsInClaim = level.shipObjectWorld.getAllAirComponentsFromClaim(dimension, loadedShip.chunkClaim)
-                    var newTotal = 0.0
-                    var centerSum = Vector3d(0.0, 0.0, 0.0)
-                    if (allComponentsInClaim.isNotEmpty()) {
-                        for (component in allComponentsInClaim) {
-                            if (level.shipObjectWorld.isIsolatedAir(
-                                    component.x(), component.y(), component.z(), dimension
-                                ) != ConnectionStatus.DISCONNECTED
-                            ) continue
-                            val componentSize = level.shipObjectWorld.getAirComponentSize(
-                                component.x(), component.y(), component.z(), dimension
-                            )
-                            val componentVoxels = level.shipObjectWorld.indexAirComponentVoxels(
-                                component.x(), component.y(), component.z(), dimension
-                            )
-                            val componentCenter = componentVoxels.centerFromVoxelSet()
-
-                            newTotal += componentSize
-                            centerSum.add(
-                                componentCenter.x() * componentSize,
-                                componentCenter.y() * componentSize,
-                                componentCenter.z() * componentSize
-                            )
-                        }
-                    }
-                    if (newTotal > 0.0) {
-                        centerSum.div(newTotal)
-                    } else {
-                        centerSum.set(0.0, 0.0, 0.0)
-                    }
-                    buoyancyHandler?.buoyancyData?.pocketVolumeTotal = newTotal.toDouble()
-                    if (loadedShip.shipAABB?.containsPoint(centerSum.x().toFloat(), centerSum.y().toFloat(), centerSum.z().toFloat()) != false) buoyancyHandler?.buoyancyData?.pocketCenterAverage = centerSum
-                    //println("is center sum contained within ship aabb?: ${loadedShip.shipAABB?.containsPoint(centerSum.x().toFloat(), centerSum.y().toFloat(), centerSum.z().toFloat())}")
-                }
+            if (loadedShip != null && VSGameConfig.SERVER.enablePocketBuoyancy) {
+                deferredEffects.buoyancyShipIds += loadedShip.id
             }
-            if (ValkyrienSkiesMod.vsCore.hooks.enableConnectivity) {
-                ValkyrienSkiesMod.splitHandler.queueSplit(level, level.getShipManagingPos(x.toDouble(), y.toDouble(), z.toDouble())?.id)
+            deferredEffects.splitShipIds += level.getShipManagingPos(x.toDouble(), y.toDouble(), z.toDouble())?.id ?: -1L
+        }
+    }
+
+    private fun recomputePocketBuoyancy(level: ServerLevel, loadedShip: LoadedServerShip) {
+        if (!VSGameConfig.SERVER.enablePocketBuoyancy) return
+
+        val buoyancyHandler = loadedShip.getAttachment(BuoyancyHandlerAttachment::class.java)
+        val dimension = loadedShip.chunkClaimDimension
+        val allComponentsInClaim = level.shipObjectWorld.getAllAirComponentsFromClaim(dimension, loadedShip.chunkClaim)
+        var newTotal = 0.0
+        val centerSum = Vector3d(0.0, 0.0, 0.0)
+        if (allComponentsInClaim.isNotEmpty()) {
+            for (component in allComponentsInClaim) {
+                if (level.shipObjectWorld.isIsolatedAir(
+                        component.x(), component.y(), component.z(), dimension
+                    ) != ConnectionStatus.DISCONNECTED
+                ) continue
+                val componentSize = level.shipObjectWorld.getAirComponentSize(
+                    component.x(), component.y(), component.z(), dimension
+                )
+                val componentVoxels = level.shipObjectWorld.indexAirComponentVoxels(
+                    component.x(), component.y(), component.z(), dimension
+                )
+                val componentCenter = componentVoxels.centerFromVoxelSet()
+
+                newTotal += componentSize
+                centerSum.add(
+                    componentCenter.x() * componentSize,
+                    componentCenter.y() * componentSize,
+                    componentCenter.z() * componentSize
+                )
             }
         }
+        if (newTotal > 0.0) {
+            centerSum.div(newTotal)
+        } else {
+            centerSum.set(0.0, 0.0, 0.0)
+        }
+        buoyancyHandler?.buoyancyData?.pocketVolumeTotal = newTotal
+        if (loadedShip.shipAABB?.containsPoint(centerSum.x().toFloat(), centerSum.y().toFloat(), centerSum.z().toFloat()) != false) {
+            buoyancyHandler?.buoyancyData?.pocketCenterAverage = centerSum
+        }
+    }
 
-
+    private fun Set<SparseVoxelPosition>.centerFromVoxelSet() : Vector3dc {
+        val center = Vector3d(0.0, 0.0, 0.0)
+        if (this.isEmpty()) {
+            return center
+        }
+        for (voxel in this) {
+            center.add(
+                voxel.x.toDouble() + ((voxel.extent - 1L).toDouble() / 2.0) + 0.5,
+                voxel.y.toDouble() + ((voxel.extent - 1L).toDouble() / 2.0) + 0.5,
+                voxel.z.toDouble() + ((voxel.extent - 1L).toDouble() / 2.0) + 0.5
+            )
+        }
+        center.div(this.size.toDouble())
+        return center
     }
 
     /**

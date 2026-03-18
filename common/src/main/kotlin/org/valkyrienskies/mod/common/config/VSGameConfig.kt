@@ -268,6 +268,16 @@ object VSGameConfig {
         )
         var defaultSplitGraceTimer = 2
 
+        @ConfigEntry(
+            description = "The approximate amount of server time budget to spend on queued ship assembly work each tick, in microseconds."
+        )
+        var assemblyWorkBudgetMicros = 5000
+
+        @ConfigEntry(
+            description = "The maximum number of changed block positions whose lighting will be refreshed per tick for queued ship assembly jobs."
+        )
+        var assemblyLightBudget = 2048
+
         @ConfigCategory(title = "Commands")
         val Commands = COMMANDS()
 
