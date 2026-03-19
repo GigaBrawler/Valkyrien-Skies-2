@@ -139,6 +139,7 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
             final List<BlockState> blockStateList = new ArrayList<>(Block.BLOCK_STATE_REGISTRY.size());
             Block.BLOCK_STATE_REGISTRY.forEach((blockStateList::add));
             MassDatapackResolver.INSTANCE.registerAllBlockStates(blockStateList);
+            valkyrienskies$unfreezeBlockStateRegistry();
             ValkyrienSkiesMod.getVsCore().registerBlockStates(MassDatapackResolver.INSTANCE.getBlockStateData());
         }
 
@@ -183,6 +184,19 @@ public abstract class MixinMinecraftServer implements IShipObjectWorldServerProv
                 63.0,
                 962.0
             );
+        }
+    }
+
+    @Unique
+    private static void valkyrienskies$unfreezeBlockStateRegistry() {
+        try {
+            final Object blockTypes = ValkyrienSkiesMod.getVsCore().getBlockTypes();
+            final Object registry = blockTypes.getClass().getField("b").get(blockTypes);
+            // Integrated-server restarts reuse the same VS core instance, so the block-state registry
+            // may still be frozen from the previous world even though datapack state was reloaded.
+            registry.getClass().getField("h").setBoolean(registry, false);
+        } catch (final ReflectiveOperationException ignored) {
+            // If core internals changed, keep the original behavior instead of failing server startup here.
         }
     }
 
