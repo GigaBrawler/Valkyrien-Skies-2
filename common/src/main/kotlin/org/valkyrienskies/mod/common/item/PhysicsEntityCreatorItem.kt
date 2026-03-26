@@ -46,8 +46,7 @@ class PhysicsEntityCreatorItem(
             }
 
             val transform = vsCore.newShipTransform(entityPos, Vector3d())
-            // Make it weight only 500 so that it floats
-            val physicsEntityData = VSPhysicsEntity.createBasicSphereData(shipId, transform, sphereRadius, mass = 500.0)
+            val physicsEntityData = VSPhysicsEntity.createBasicSphereData(shipId, transform, sphereRadius)
             entity.setPhysicsEntityData(physicsEntityData)
             entity.setPos(entityPos.x(), entityPos.y(), entityPos.z())
             level.addFreshEntity(entity)

@@ -6,7 +6,6 @@ bin
 .settings
 .metadata
 .classpath
-.factorypath
 .project
 
 # idea
