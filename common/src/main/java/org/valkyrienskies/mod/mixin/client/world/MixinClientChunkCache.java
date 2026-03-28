@@ -32,6 +32,7 @@ import org.valkyrienskies.core.api.ships.ClientShip;
 import org.valkyrienskies.core.api.ships.properties.ChunkClaim;
 import org.valkyrienskies.core.internal.world.VsiClientShipWorld;
 import org.valkyrienskies.core.internal.world.chunks.VsiTerrainUpdate;
+import org.valkyrienskies.mod.air_pockets.client.ShipWaterPocketLiquidOverlay;
 import org.valkyrienskies.mod.common.VSGameUtilsKt;
 import org.valkyrienskies.mod.common.config.VSGameConfig;
 import org.valkyrienskies.mod.compat.SodiumCompat;
@@ -155,6 +156,7 @@ public abstract class MixinClientChunkCache implements ClientChunkCacheDuck {
 
     @Inject(method = "drop", at = @At("HEAD"), cancellable = true)
     public void preUnload(final int chunkX, final int chunkZ, final CallbackInfo ci) {
+        ShipWaterPocketLiquidOverlay.invalidateExteriorFluidChunk(this.level, chunkX, chunkZ);
         if (VSGameUtilsKt.isChunkInShipyard(level, chunkX, chunkZ)) {
             LevelChunk worldChunk = vs$shipChunks.remove(ChunkPos.asLong(chunkX, chunkZ));
             if (ValkyrienCommonMixinConfigPlugin.getVSRenderer() != VSRenderer.SODIUM) {
@@ -197,14 +199,19 @@ public abstract class MixinClientChunkCache implements ClientChunkCacheDuck {
 
     @Inject(
         method = "getChunk(IILnet/minecraft/world/level/chunk/ChunkStatus;Z)Lnet/minecraft/world/level/chunk/LevelChunk;",
-        at = @At("HEAD"), cancellable = true)
-    public void preGetChunk(
+        at = @At("RETURN"),
+        cancellable = true
+    )
+    public void postGetChunk(
         final int chunkX,
         final int chunkZ,
         final ChunkStatus chunkStatus,
         final boolean bl,
         final CallbackInfoReturnable<LevelChunk> cir
     ) {
+        if (!VSGameUtilsKt.isChunkInShipyard(this.level, chunkX, chunkZ)) {
+            return;
+        }
         final LevelChunk shipChunk = vs$shipChunks.get(ChunkPos.asLong(chunkX, chunkZ));
         if (shipChunk != null) {
             cir.setReturnValue(shipChunk);
